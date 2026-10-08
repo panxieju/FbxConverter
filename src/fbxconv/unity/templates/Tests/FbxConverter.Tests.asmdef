@@ -1,0 +1,30 @@
+{
+    "name": "FbxConverter.Tests",
+    "rootNamespace": "FbxConverter.Tests",
+    "references": [
+        "FbxConverter.Editor",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "FBXCONV_HAS_TEST_FRAMEWORK"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.test-framework",
+            "expression": "",
+            "define": "FBXCONV_HAS_TEST_FRAMEWORK"
+        }
+    ],
+    "noEngineReferences": false
+}

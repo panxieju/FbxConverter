@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fbxconv"
+version = "0.1.0"
+description = "Unreal Engine -> Unity FBX conversion pipeline for skeletal meshes and animations"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "FbxConverter" }]
+dependencies = []
+
+[project.optional-dependencies]
+gui = ["PyQt5>=5.15"]
+dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.6", "mypy>=1.11"]
+
+[project.scripts]
+fbxconv = "fbxconv.cli:main"
+
+[project.gui-scripts]
+fbxconv-gui = "fbxconv.ui.app:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fbxconv = [
+    "ue_scripts/*.py",
+    "unity/templates/*.cs",
+    "unity/templates/*.asmdef",
+    "unity/templates/Tests/*.cs",
+    "unity/templates/Tests/*.asmdef",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    "E501",
+    # CJK punctuation (，。：（）) is not "ambiguous" for this codebase.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# These scripts run inside Unreal's bundled Python 3.11, not the app runtime.
+# They deliberately use defensive try/except probing of optional engine APIs
+# and simple %-formatting for log lines.
+"src/fbxconv/ue_scripts/*.py" = [
+    "UP031",   # %-formatting is fine on the Unreal side
+    "SIM105",  # contextlib.suppress would hide which probe failed
+    "RUF046",  # int(round(x)) is explicit about the frame-count intent
+]
+"tests/*.py" = ["SIM105"]
+# PyInstaller injects Analysis / PYZ / EXE / COLLECT / SPECPATH into the spec's
+# namespace at build time, so they are not static undefined names.
+"FbxConverter.spec" = ["F821"]
+
+[tool.mypy]
+python_version = "3.10"
+packages = ["fbxconv"]
+mypy_path = "src"
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true

@@ -1,0 +1,40 @@
+# Normalise line endings so a Windows checkout and a CI checkout agree.
+#
+# Sources here are consumed by three different toolchains (CPython, Unreal's
+# bundled Python 3.11, and Unity's C# compiler), all of which accept LF. Pinning
+# LF in the repository avoids the whole-file churn that `core.autocrlf` causes
+# whenever a file is touched.
+
+* text=auto eol=lf
+
+# Explicit, so a misconfigured global core.autocrlf cannot override them.
+*.py        text eol=lf
+*.cs        text eol=lf
+*.asmdef    text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.toml      text eol=lf
+*.spec      text eol=lf
+*.txt       text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+
+# Windows-only helpers keep CRLF.
+*.ps1       text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Binary: never touch these.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.fbx       binary
+*.uasset    binary
+*.umap      binary
+*.dll       binary
+*.exe       binary
+*.pdb       binary

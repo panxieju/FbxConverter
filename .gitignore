@@ -1,0 +1,114 @@
+# ============================================================================
+# FbxConverter
+# ============================================================================
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging / build output
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / lint / type caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# --- This tool's own output -------------------------------------------------
+# Default export destination and scratch area (see fbxconv.config).
+UnityExport/
+.fbxconv/
+.scratch/
+.verify/
+Reports/export_report.json
+Reports/unity_import_report.json
+
+# The tool never modifies sources, but guard against accidental captures of
+# Unreal / Unity projects it may be pointed at.
+UnrealProject/
+[Ii]ntermediate/
+[Dd]erivedDataCache/
+[Bb]inaries/Win64/
+[Ss]aved/[Ll]ogs/
+
+# Unity / Tuanjie project artefacts
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/[Bb]uilds/
+[Ll]ogs/
+[Uu]serSettings/
+[Mm]emoryCaptures/
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb.meta
+*.mdb.meta
+sysinfo.txt
+
+# --- Logs and diagnostics ---------------------------------------------------
+*.log
+*.log.*
+crashlytics-build.properties
+
+# --- OS ---------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# --- Editors ----------------------------------------------------------------
+# PyCharm / IntelliJ: this project deliberately shares its module config
+# (.iml, modules.xml, misc.xml, vcs.xml, inspectionProfiles), matching the
+# .idea/.gitignore JetBrains itself wrote. Only per-user state is dropped.
+.idea/workspace.xml
+.idea/shelf/
+.idea/usage.statistics.xml
+.idea/dictionaries/
+.idea/tasks.xml
+.idea/httpRequests/
+
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.vs/
+*.swp
+*.swo
+*~
+
+# --- Archives ---------------------------------------------------------------
+*.7z
+*.zip
+*.rar
+*.tar.gz
+
+# --- PyInstaller ------------------------------------------------------------
+# FbxConverter.spec is source and IS committed; only its output is ignored.
+*.manifest
