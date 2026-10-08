@@ -285,9 +285,84 @@ def resolve_editor(path: str | os.PathLike[str]) -> UnrealInstall | None:
     return None
 
 
+def _major_minor(version: str) -> str:
+    parts = re.findall(r"\d+", version or "")
+    return ".".join(parts[:2])
+
+
+def project_engine_association(project_file: str | os.PathLike[str]) -> str:
+    """Read ``EngineAssociation`` from a ``.uproject`` (``""`` when unavailable).
+
+    The value is usually ``Major.Minor`` ("5.4"), but can also be a GUID for a
+    source build -- callers must tolerate a non-version string.
+    """
+    try:
+        # utf-8-sig: Unreal writes a BOM on some platforms.
+        text = Path(project_file).read_text(encoding="utf-8-sig")
+        payload = json.loads(text)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("EngineAssociation") or "").strip()
+
+
+def find_install_for_version(
+    association: str, installs: tuple[UnrealInstall, ...] | None = None
+) -> UnrealInstall | None:
+    """The installed engine matching a ``Major.Minor`` association, if any."""
+    wanted = _major_minor(association)
+    if not wanted:
+        return None
+    for install in installs if installs is not None else find_installs():
+        if _major_minor(install.version) == wanted:
+            return install
+    return None
+
+
+def resolve_install_for_project(
+    project_file: str | os.PathLike[str] | None,
+    preferred: UnrealInstall,
+) -> UnrealInstall:
+    """Prefer the engine the project was authored against.
+
+    Opening a 5.4 project with a 5.8 editor triggers asset upgrades and can
+    silently change behaviour, so the declared association outranks "newest
+    installed". Falls back to ``preferred`` (with a warning) when the matching
+    engine is not installed.
+    """
+    if project_file is None:
+        return preferred
+
+    association = project_engine_association(project_file)
+    if not association:
+        return preferred
+
+    match = find_install_for_version(association)
+    if match is None:
+        _log.warning(
+            "项目声明引擎 %s，但本机未安装该版本；改用 %s",
+            association,
+            preferred.label,
+        )
+        return preferred
+
+    if match.root != preferred.root:
+        _log.info(
+            "项目声明引擎 %s，改用 %s（原选 %s）",
+            association,
+            match.label,
+            preferred.label,
+        )
+    return match
+
+
 __all__ = [
     "UnrealInstall",
     "find_default_install",
+    "find_install_for_version",
     "find_installs",
+    "project_engine_association",
     "resolve_editor",
+    "resolve_install_for_project",
 ]

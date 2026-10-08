@@ -314,6 +314,17 @@ class ScanResult:
     file_count: int = 0
     scan_seconds: float = 0.0
 
+    scope_prefix: str = ""
+    """Package prefix actually scanned. Empty means the whole mount point.
+
+    Selecting a subfolder of ``Content`` still mounts at ``Content`` (so
+    ``/Game/...`` dependencies resolve) but only reports this subtree.
+    """
+
+    unreal_editor: str | None = None
+    """Editor binary that performed the scan, so export reuses the same one --
+    and therefore the same engine version the project was authored against."""
+
     @property
     def total_animations(self) -> int:
         return sum(g.animation_count for g in self.groups)

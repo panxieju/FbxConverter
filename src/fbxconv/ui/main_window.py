@@ -24,7 +24,7 @@ from ..errors import FbxConvError
 from ..logutil import CallbackHandler, get_logger
 from ..models import ExportOutcome, ExportRequest, ScanResult
 from ..report import ExportReport
-from ..unreal.locator import UnrealInstall
+from ..unreal.locator import UnrealInstall, resolve_editor
 from .pages import DirectoryPage, RunPage, ScanPage, SelectPage, SettingsPage
 from .widgets import COLOR_MUTED, StepList, open_in_file_manager
 from .worker import ExportWorker, ScanWorker, make_plan
@@ -221,6 +221,15 @@ class MainWindow(QMainWindow):
         self.scan = scan
         self.plan = None
         self.report = None
+
+        # The scan may have switched engines so that a project authored for
+        # 5.4 is not opened (and upgraded) by a newer editor. Export has to
+        # reuse whichever engine actually worked.
+        if scan.unreal_editor:
+            resolved = resolve_editor(scan.unreal_editor)
+            if resolved is not None:
+                self.install = resolved
+
         self.scan_page.set_running(False)
         self.scan_page.progress.set_fraction(1.0)
         self.scan_page.progress.set_caption(

@@ -152,8 +152,9 @@ namespace FbxConverter.Editor
         public string dominantAxis;
         public int animationCount;
         public int animationsWithRootMotion;
+        public int animationsWithRootTravel;
         public int animationFailures;
-        public int clipsWithPositionCurves;
+        public int clipsWithTranslationCurves;
         public int totalCurveBindings;
         public readonly List<string> sampleCurves = new List<string>();
         public readonly List<string> rootMotionPaths = new List<string>();
@@ -311,6 +312,7 @@ namespace FbxConverter.Editor
                 character = character.name,
                 animationCount = 0,
                 animationsWithRootMotion = 0,
+                animationsWithRootTravel = 0,
                 animationFailures = 0,
             };
 
@@ -410,11 +412,18 @@ namespace FbxConverter.Editor
                     AssetDatabase.ImportAsset(animationAssetPath, ImportAssetOptions.ForceUpdate);
 
                     entry.animationCount++;
-                    string rootPath;
-                    int positionBindings;
+                    bool translates;
+                    bool travels;
+                    string rootSample;
+                    int translationBindings;
                     int totalBindings;
-                    bool hasRootMotion = FindRootMotion(
-                        animationAssetPath, out rootPath, out positionBindings, out totalBindings);
+                    AnalyseRootMotion(
+                        animationAssetPath,
+                        out translates,
+                        out travels,
+                        out rootSample,
+                        out translationBindings,
+                        out totalBindings);
                     entry.totalCurveBindings += totalBindings;
                     if (totalBindings == 0)
                     {
@@ -422,21 +431,21 @@ namespace FbxConverter.Editor
                         entry.problems.Add(animation.name +
                             "：导入后的 AnimationClip 没有任何曲线（检查 FBX 是否包含动画数据）。");
                     }
-                    if (positionBindings > 0)
+                    if (translationBindings > 0)
                     {
-                        entry.clipsWithPositionCurves++;
+                        entry.clipsWithTranslationCurves++;
                     }
                     if (entry.sampleCurves.Count < 12)
                     {
                         CollectSampleCurves(animationAssetPath, entry.sampleCurves);
                     }
-                    if (hasRootMotion)
+                    if (translates)
                     {
                         entry.animationsWithRootMotion++;
-                        if (!string.IsNullOrEmpty(rootPath) &&
-                            !entry.rootMotionPaths.Contains(rootPath))
+                        if (!string.IsNullOrEmpty(rootSample) &&
+                            !entry.rootMotionPaths.Contains(rootSample))
                         {
-                            entry.rootMotionPaths.Add(rootPath);
+                            entry.rootMotionPaths.Add(rootSample);
                         }
                     }
                     else if (animation.rootMotion)
@@ -445,6 +454,10 @@ namespace FbxConverter.Editor
                         // in place, so this must not mark the character as bad.
                         entry.notices.Add(animation.name +
                             "：未检测到根骨骼位移（原地动画）。");
+                    }
+                    if (travels)
+                    {
+                        entry.animationsWithRootTravel++;
                     }
                 }
             }
@@ -741,49 +754,80 @@ namespace FbxConverter.Editor
         /// clip has at all, which distinguishes "in-place animation" from
         /// "we looked in the wrong place".
         /// </summary>
-        private static bool FindRootMotion(
+        private static void AnalyseRootMotion(
             string animationAssetPath,
-            out string rootPath,
-            out int positionBindings,
+            out bool translates,
+            out bool travels,
+            out string sample,
+            out int translationBindings,
             out int totalBindings)
         {
-            rootPath = null;
-            positionBindings = 0;
+            translates = false;
+            travels = false;
+            sample = null;
+            translationBindings = 0;
             totalBindings = 0;
 
             AnimationClip clip = LoadPrimaryClip(animationAssetPath);
             if (clip == null)
             {
-                return false;
+                return;
             }
 
             foreach (EditorCurveBinding binding in AnimationUtility.GetCurveBindings(clip))
             {
                 totalBindings++;
-                if (binding.propertyName == null ||
-                    !binding.propertyName.StartsWith("m_LocalPosition", StringComparison.Ordinal))
-                {
-                    continue;
-                }
-                positionBindings++;
 
+                string property = binding.propertyName ?? string.Empty;
                 string path = binding.path ?? string.Empty;
-                bool atRoot = path.Length == 0 ||
-                              path.Equals("root", StringComparison.OrdinalIgnoreCase) ||
-                              path.EndsWith("/root", StringComparison.OrdinalIgnoreCase);
-                if (!atRoot)
+
+                // Humanoid rigs do not emit m_LocalPosition at all: root
+                // translation arrives as muscle curves named RootT.x/y/z.
+                // Checking only for m_LocalPosition silently reports zero root
+                // motion for every Humanoid clip.
+                bool humanoidRoot = property.StartsWith("RootT.", StringComparison.Ordinal);
+                bool genericRoot = property.StartsWith("m_LocalPosition", StringComparison.Ordinal);
+
+                if (!humanoidRoot && !genericRoot)
                 {
                     continue;
                 }
+
+                if (genericRoot)
+                {
+                    bool atRoot = path.Length == 0 ||
+                                  path.Equals("root", StringComparison.OrdinalIgnoreCase) ||
+                                  path.EndsWith("/root", StringComparison.OrdinalIgnoreCase);
+                    if (!atRoot)
+                    {
+                        continue;
+                    }
+                }
+
+                translationBindings++;
 
                 AnimationCurve curve = AnimationUtility.GetEditorCurve(clip, binding);
-                if (curve != null && CurveVaries(curve))
+                if (curve == null || !CurveVaries(curve))
                 {
-                    rootPath = path.Length == 0 ? "<model root>" : path;
-                    return true;
+                    continue;
+                }
+
+                translates = true;
+                if (sample == null)
+                {
+                    sample = humanoidRoot
+                        ? property
+                        : (path.Length == 0 ? "<model root>" : path);
+                }
+
+                // Horizontal channels decide whether the character actually
+                // travels, as opposed to just bobbing vertically in place.
+                char channel = property[property.Length - 1];
+                if (channel == 'x' || channel == 'z')
+                {
+                    travels = true;
                 }
             }
-            return false;
         }
 
         private static bool CurveVaries(AnimationCurve curve)
@@ -905,7 +949,8 @@ namespace FbxConverter.Editor
                 builder.Append("      \"dominantAxis\": \"").Append(Escape(entry.dominantAxis)).Append("\",\n");
                 builder.Append("      \"animationCount\": ").Append(entry.animationCount).Append(",\n");
                 builder.Append("      \"animationsWithRootMotion\": ").Append(entry.animationsWithRootMotion).Append(",\n");
-                builder.Append("      \"clipsWithPositionCurves\": ").Append(entry.clipsWithPositionCurves).Append(",\n");
+                builder.Append("      \"animationsWithRootTravel\": ").Append(entry.animationsWithRootTravel).Append(",\n");
+                builder.Append("      \"clipsWithTranslationCurves\": ").Append(entry.clipsWithTranslationCurves).Append(",\n");
                 builder.Append("      \"totalCurveBindings\": ").Append(entry.totalCurveBindings).Append(",\n");
                 builder.Append("      \"sampleCurves\": [");
                 for (int s = 0; s < entry.sampleCurves.Count; s++)

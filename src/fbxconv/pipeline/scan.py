@@ -26,7 +26,7 @@ from ..models import (
     ScanResult,
     SkeletonGroup,
 )
-from ..unreal.locator import UnrealInstall
+from ..unreal.locator import UnrealInstall, resolve_install_for_project
 from ..unreal.paths import sanitise_filename
 from ..unreal.project import MountMode, ensure_conversion_project
 from ..unreal.runner import UnrealRunner
@@ -77,6 +77,40 @@ def _parent_segments(package_path: str, mount_point: str) -> list[str]:
         text = text[len(prefix) :]
     parts = [p for p in text.split("/") if p]
     return parts[:-1] if parts else []
+
+
+def _short_location(package_path: str, mount_point: str) -> str:
+    """Readable package location, trimmed from the middle when deep."""
+    segments = _parent_segments(package_path, mount_point)
+    if not segments:
+        return ""
+    if len(segments) > 3:
+        segments = [segments[0], "…", *segments[-2:]]
+    return "/".join(segments)
+
+
+def _disambiguate_display_names(
+    groups: Sequence[SkeletonGroup], mount_point: str
+) -> None:
+    """Qualify skeleton names that appear in more than one pack.
+
+    Downloaded packs routinely each ship an asset literally called
+    ``UE4_Mannequin_Skeleton``. Four identical rows make the selection UI
+    unusable, so colliding names get their package location appended.
+    """
+    counts: dict[str, int] = {}
+    for group in groups:
+        counts[group.display_name] = counts.get(group.display_name, 0) + 1
+
+    for group in groups:
+        if counts.get(group.display_name, 0) < 2:
+            continue
+        anchor = group.skeleton_path or (
+            group.meshes[0].package_path if group.meshes else ""
+        )
+        location = _short_location(anchor, mount_point) if anchor else ""
+        if location:
+            group.display_name = f"{group.display_name}  ({location})"
 
 
 def derive_group_name(
@@ -187,10 +221,19 @@ def group_assets(
         group.missing_dependencies = sorted(missing)
         group.notes = sorted(set(group.notes))
 
+    # Drop placeholder buckets that received nothing -- an "unlinked skeleton"
+    # row with zero meshes and zero animations is pure noise in the UI.
     groups = sorted(
-        buckets.values(),
-        key=lambda g: (g.skeleton_path is None, -len(g.meshes), -len(g.animations), g.display_name),
+        (g for g in buckets.values() if g.meshes or g.animations),
+        key=lambda g: (
+            g.skeleton_path is None,
+            -len(g.meshes),
+            -len(g.animations),
+            g.display_name,
+        ),
     )
+
+    _disambiguate_display_names(groups, mount_point)
 
     taken: set[str] = set()
     for group in groups:
@@ -318,12 +361,31 @@ class ScanSession:
     discovery: DiscoveryResult | None = field(default=None, init=False)
     project_file: Path | None = field(default=None, init=False)
     mount_point: str = field(default=MOUNT_POINT, init=False)
+    scope_prefix: str = field(default="", init=False)
     conversion_project: Path | None = field(default=None, init=False)
 
     def _progress(self, message: str, fraction: float | None = None) -> None:
         _log.info("%s", message)
         if self.on_progress is not None:
             self.on_progress(message, fraction)
+
+    def _resolve_scope(self, discovery: DiscoveryResult) -> str:
+        """Package path of the user's selection, relative to the mount point.
+
+        Selecting ``Content/CLazyAnimpack`` mounts at ``Content`` (so
+        ``/Game/...`` references resolve) but should only *report*
+        ``/Game/CLazyAnimpack``. Without this the whole project gets scanned.
+        """
+        try:
+            relative = Path(discovery.original_root).resolve().relative_to(
+                Path(discovery.content_root).resolve()
+            )
+        except ValueError:
+            return ""
+        parts = relative.parts
+        if not parts or parts == (".",):
+            return ""
+        return self.mount_point.rstrip("/") + "/" + "/".join(parts)
 
     def prepare(self, content_root: str | Path) -> Path:
         """Discover files and materialise the Unreal project to scan with."""
@@ -337,9 +399,21 @@ class ScanSession:
         self.discovery = discovery
         self.project_file = discovery.project_file
         self.mount_point = detect_mount_point(discovery.content_root, discovery.project_file)
+        self.scope_prefix = self._resolve_scope(discovery)
+
+        # A project declares the engine it was authored against; honouring it
+        # avoids opening (and silently upgrading) a 5.4 project with 5.8.
+        if discovery.project_file is not None:
+            self.install = resolve_install_for_project(
+                discovery.project_file, self.install
+            )
 
         if discovery.project_file is not None:
             self._progress(f"使用现有项目：{discovery.project_file.name}")
+            if self.scope_prefix:
+                self._progress(
+                    f"挂载点 {self.mount_point}（依赖可解析），仅扫描 {self.scope_prefix}"
+                )
         else:
             self._progress("未找到 .uproject，正在创建独立转换项目…")
             project = ensure_conversion_project(
@@ -394,6 +468,7 @@ class ScanSession:
             "fbxconv_scan.py",
             {
                 "mount_point": self.mount_point,
+                "scope_prefix": self.scope_prefix,
                 "deep_resolve": self.deep_resolve,
             },
             label="scan",
@@ -432,6 +507,8 @@ class ScanSession:
             conversion_project=self.conversion_project,
             engine_version=str(data.get("engine_version") or self.install.version),
             unreal_project=project_file,
+            scope_prefix=self.scope_prefix,
+            unreal_editor=str(self.install.editor_cmd),
             groups=groups,
             assets=assets,
             warnings=warnings,

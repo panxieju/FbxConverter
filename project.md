@@ -353,6 +353,39 @@ EditMode 测试的投放由 Python 决策（检查 `Packages/manifest.json` /
 的 `defineConstraints`。原因：`UNITY_INCLUDE_TESTS` 在编辑器下**始终已定义**，
 实测无法用它跳过；而一个编译失败的测试程序集会**阻断整个工程进入 Play 模式**。
 
+### 6.9 挂载点 ≠ 扫描范围
+
+用户选择 `Content/CLazyAnimpack` 时，两件事必须分开：
+
+- **挂载点**必须是 `Content`，否则资源内部的 `/Game/CLazyAnimpack/...` 引用无法解析；
+- **扫描范围**必须是 `/Game/CLazyAnimpack`，否则会把整个工程（实测 7596 个资源）都扫进来。
+
+早期实现把两者混为一谈，结果是“我只选了一个文件夹，它扫了我整个项目”。
+现在 `ScanSession._resolve_scope()` 从「选择目录」相对「挂载点」推导出包前缀，
+作为 `scope_prefix` 传给 Unreal 侧：注册表按该前缀查询，而**依赖仍在整个挂载点内解析**。
+
+### 6.10 引擎版本必须跟随项目声明
+
+`.uproject` 里的 `EngineAssociation`（如 `"5.4"`）是权威信息。默认取「最新安装」
+会让 5.4 的工程被 5.8 编辑器打开，触发资源升级并可能改变行为。
+`resolve_install_for_project()` 因此让声明优先于「最新」，未安装该版本时才回退并告警。
+
+`ScanResult.unreal_editor` 记录实际使用的编辑器，导出阶段复用它——否则扫描用 5.4、
+导出用 5.8，两边看到的资源版本可能不一致。
+
+### 6.11 Humanoid 与 Generic 的 Root Motion 存法不同
+
+这是实测第三方动作包时踩到的：**Humanoid 剪辑根本不产生 `m_LocalPosition` 曲线**，
+根位移以肌肉曲线 `RootT.x/y/z` 的形式存在。只按 `m_LocalPosition` 检测，
+会把 212 个动画里的根运动全部误报为 0。
+
+现在 `AnalyseRootMotion()` 同时识别两种约定，并区分：
+
+- `animationsWithRootMotion` —— 根骨骼是否发生位移（含垂直起伏）
+- `animationsWithRootTravel` —— 是否发生**水平**位移，即真正会“走开”的动画
+
+后者才是有用的信号：原地循环动画通常有垂直起伏但没有水平位移。
+
 ---
 
 ## 7. 目录结构

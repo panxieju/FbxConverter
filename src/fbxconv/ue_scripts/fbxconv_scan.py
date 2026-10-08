@@ -213,6 +213,12 @@ def body(warnings):
 
     job = common.read_job()
     mount_point = str(job.get("mount_point") or "/Game").rstrip("/")
+    # The selection defines the *scope*; the mount point defines where
+    # dependencies resolve from. They differ when the user picks a subfolder of
+    # Content: mounting has to stay at Content so /Game/... references still
+    # resolve, but only the selected subtree should be reported.
+    scope_prefix = str(job.get("scope_prefix") or "").strip().rstrip("/")
+    query_path = scope_prefix or mount_point
     deep_resolve = bool(job.get("deep_resolve", True))
     max_assets = int(job.get("max_assets") or 200000)
 
@@ -220,10 +226,15 @@ def body(warnings):
     content_dir = unreal.Paths.project_content_dir()
     engine_version = str(unreal.SystemLibrary.get_engine_version())
 
-    common.emit("phase", message="正在扫描资源注册表", mount_point=mount_point)
+    common.emit(
+        "phase",
+        message="正在扫描资源注册表",
+        mount_point=mount_point,
+        scope=scope_prefix,
+    )
     common.scan_paths(registry, [mount_point])
 
-    asset_data_list = common.assets_under(registry, mount_point)
+    asset_data_list = common.assets_under(registry, query_path)
     total = min(len(asset_data_list), max_assets)
     common.emit("phase", message="正在解析资源类型与依赖", total=total)
     if len(asset_data_list) > max_assets:
@@ -252,6 +263,11 @@ def body(warnings):
     for index, asset_data in enumerate(asset_data_list[:max_assets]):
         package_name = common.package_name_of(asset_data)
         if not package_name:
+            continue
+        # Defensive: get_assets_by_path should already be scoped.
+        if scope_prefix and not (
+            package_name == scope_prefix or package_name.startswith(scope_prefix + "/")
+        ):
             continue
         class_name = common.asset_class_name(asset_data)
         tags = common.tags_of(asset_data)
@@ -384,6 +400,7 @@ def body(warnings):
         "engine_version": engine_version,
         "content_dir": common.to_posix(content_dir),
         "mount_point": mount_point,
+        "scope_prefix": scope_prefix,
         "asset_count": len(records),
         "load_failures": load_failures,
         "assets": records,

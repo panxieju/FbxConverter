@@ -217,7 +217,9 @@ Window > General > Test Runner > EditMode > FbxConverter.Tests
 | UE5 支持 | Manny／Quinn 独立预设通过实际网格及动画验证 | ✅ | `--group Mannequins` |
 | 独立目录支持 | 没有 `.uproject` 时保留资源路径并在转换项目中成功加载 | ✅ | 扫描输出中的“转换项目” |
 
-### 实测结果（UE 5.8 + 团结引擎 1.9.3，UE 模板 Mannequin 内容）
+### 实测结果
+
+**A. UE 模板 Mannequin 内容（UE 5.8 + 团结引擎 1.9.3）**
 
 ```
 扫描：145 个 .uasset → 145 个确认；3 组（5 网格 / 40 动画）；缺失依赖 0
@@ -226,6 +228,29 @@ Unity：2/2 角色通过
        Mannequins    : Avatar 有效，高度 1.813 m，主轴 Y(up)，39 个动画，0 失败
        Mannequin_UE4 : Avatar 有效，高度 1.833 m，主轴 Y(up)， 1 个动画，0 失败
 ```
+
+**B. 第三方动作包 `CLazyAnimpack`（UE 5.4 + 团结引擎 1.9.3）**
+
+真实工程 `G:\UnrealEngineProjects\Escape`，工程声明 `EngineAssociation: "5.4"`。
+
+```
+引擎：项目声明 5.4 → 自动改用 UE 5.4.4（默认会选到 5.8）
+范围：挂载点 /Game（依赖可解析），仅扫描 /Game/CLazyAnimpack → 确认 300 个资源
+导出：213/213 成功（1 网格 + 212 动画），单次启动 70.3 秒
+Unity：1/1 角色通过
+       高度         : 1.8329 m      ← UE4 Mannequin 标准身高，单位正确
+       主轴         : Y(up)          ← 宽 1.4075 / 深 0.4352，标准 T-Pose
+       Avatar       : 有效且为人形（Humanoid）
+       动画         : 212 个全部导入，0 失败，共 27,560 条曲线
+       根运动       : 210 个动画有根位移，其中 210 个有水平位移
+```
+
+### 两点行为说明
+
+- **扫描范围跟随你选的目录。** 选择 `Content/CLazyAnimpack` 时，挂载点仍是 `Content`
+  （这样 `/Game/...` 依赖才能解析），但只扫描并列出该子目录，不会把整个工程拖进来。
+- **引擎版本跟随工程声明。** `.uproject` 里的 `EngineAssociation` 优先于“本机最新版本”，
+  避免 5.4 工程被 5.8 编辑器打开而触发资源升级；未安装该版本时会告警并回退。
 
 ---
 
@@ -290,9 +315,13 @@ pyinstaller --clean --noconfirm FbxConverter.spec
 |---|---|
 | `未找到可用的 Unreal Engine 安装` | 设置 `FBXCONV_UNREAL_EDITOR=<...>\UnrealEditor-Cmd.exe` |
 | 扫描报“缺失依赖” | 该组引用了所选目录之外、且无法解析的资源，按提示补齐或扩大资源目录 |
+| 扫描报“疑似挂载点不匹配” | 资源包期望位于 `Content/<包名>/` 之下；改选包含该包的上一级目录 |
+| 只选了一个子目录，却扫了整个工程 | 挂载点会取其上溯到的 `Content`，但**扫描范围**仍是你选的目录；若列表里出现别的包，说明选的就是 `Content` 本身 |
+| 工程是 5.4 却用 5.8 打开 | 现在会自动读取 `.uproject` 的 `EngineAssociation`；若本机没装该版本会告警并回退 |
 | 导出全部失败：`无法加载资源` | 确认资源目录与 `.uproject` 是否匹配；转换项目应在 `<输出目录>/.fbxconv/UnrealProject` |
 | Unreal 崩溃于 `SkinnedMeshComponent` 断言 | 导出阶段被加了 `-nullrhi`；移除该参数 |
 | Unity 报 `CS0101` 重复定义 | 同一份 C# 被放进了两个目录；只保留 `Assets/UnityExport/Editor/` 一处 |
 | Unity 报找不到 `NUnit` | 项目未安装 Test Framework；删除 `Editor/Tests/` 即可（导入器本身不受影响） |
+| 报告里根运动全为 0 | 早期版本只识别 Generic 的 `m_LocalPosition`；Humanoid 走 `RootT.*` 肌肉曲线，现已同时支持 |
 
 调试时可加 `-v` 查看 DEBUG 日志，或在 GUI 第 5 步查看完整日志面板。

@@ -152,6 +152,78 @@ class TestGrouping:
         assert len(set(names)) == len(names)
 
 
+class TestGroupDisambiguation:
+    """Real packs each ship their own ``UE4_Mannequin_Skeleton``."""
+
+    def _skeleton(self, package: str) -> AssetRecord:
+        return AssetRecord(
+            package_path=package,
+            name=package.rsplit("/", 1)[-1],
+            class_name="Skeleton",
+            kind=AssetKind.SKELETON,
+        )
+
+    def _mesh(self, package: str, skeleton: str) -> AssetRecord:
+        return AssetRecord(
+            package_path=package,
+            name=package.rsplit("/", 1)[-1],
+            class_name="SkeletalMesh",
+            kind=AssetKind.SKELETAL_MESH,
+            skeleton=skeleton,
+        )
+
+    def _anim(self, package: str, skeleton: str) -> AssetRecord:
+        return AssetRecord(
+            package_path=package,
+            name=package.rsplit("/", 1)[-1],
+            class_name="AnimSequence",
+            kind=AssetKind.ANIM_SEQUENCE,
+            skeleton=skeleton,
+        )
+
+    def test_clashing_skeleton_names_are_qualified(self):
+        skel_a = "/Game/PackA/Mesh/UE4_Mannequin_Skeleton"
+        skel_b = "/Game/PackB/Mesh/UE4_Mannequin_Skeleton"
+        assets = [
+            self._skeleton(skel_a),
+            self._skeleton(skel_b),
+            self._mesh("/Game/PackA/Mesh/SK_Mannequin", skel_a),
+            self._mesh("/Game/PackB/Mesh/SK_Mannequin", skel_b),
+        ]
+
+        groups = group_assets(assets)
+        names = [g.display_name for g in groups]
+
+        assert len(groups) == 2
+        assert len(set(names)) == 2, names
+        assert all("UE4_Mannequin_Skeleton" in n for n in names)
+        assert any("PackA" in n for n in names)
+        assert any("PackB" in n for n in names)
+
+    def test_unique_names_are_not_decorated(self):
+        assets = [
+            self._skeleton("/Game/PackA/Mesh/Unique_Skeleton"),
+            self._mesh("/Game/PackA/Mesh/SK_A", "/Game/PackA/Mesh/Unique_Skeleton"),
+        ]
+        groups = group_assets(assets)
+        assert groups[0].display_name == "Unique_Skeleton"
+
+    def test_empty_buckets_are_dropped(self):
+        # A skeleton with no bound meshes or animations is pure UI noise.
+        assets = [self._skeleton("/Game/OnlyAnOrphanSkeleton")]
+        assert group_assets(assets) == []
+
+    def test_group_with_animations_but_no_mesh_is_kept(self):
+        skel = "/Game/Pack/Skeleton"
+        assets = [
+            self._skeleton(skel),
+            self._anim("/Game/Pack/Animations/Walk", skel),
+        ]
+        groups = group_assets(assets)
+        assert len(groups) == 1
+        assert groups[0].animation_count == 1
+
+
 class TestDeriveGroupName:
     def test_skips_generic_segments(self):
         taken: set[str] = set()

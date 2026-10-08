@@ -163,6 +163,8 @@ def _select_groups(
 def _print_scan(scan: ScanResult) -> None:
     print(f"内容根目录 : {scan.content_root}")
     print(f"挂载点     : {scan.mount_point}")
+    if scan.scope_prefix:
+        print(f"扫描范围   : {scan.scope_prefix}（依赖仍在整个挂载点内解析）")
     print(f"Unreal 项目: {scan.project_file or '（无，已创建独立转换项目）'}")
     if scan.conversion_project:
         print(f"转换项目   : {scan.conversion_project}")
@@ -171,12 +173,12 @@ def _print_scan(scan: ScanResult) -> None:
     for warning in scan.warnings:
         print(f"  警告: {warning}")
     print()
-    print(f"{'骨架组':<32}{'参考网格':<24}{'动画':>5}  {'状态':<10}输出目录")
-    print("-" * 92)
+    print(f"{'骨架组':<40}{'参考网格':<24}{'动画':>5}  {'状态':<10}输出目录")
+    print("-" * 100)
     for group in scan.groups:
         mesh = group.reference_mesh.name if group.reference_mesh else "-"
         print(
-            f"{(group.display_name or '-')[:31]:<32}{mesh[:23]:<24}"
+            f"{(group.display_name or '-')[:39]:<40}{mesh[:23]:<24}"
             f"{group.animation_count:>5}  {group.status.label:<10}{group_output_name(group)}"
         )
         if group.missing_dependencies:
@@ -242,6 +244,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     if scan.conversion_project
                     else None,
                     "engine_version": scan.engine_version,
+                    "unreal_editor": scan.unreal_editor,
+                    "scope_prefix": scan.scope_prefix,
                     "file_count": scan.file_count,
                     "warnings": scan.warnings,
                     "groups": [
@@ -270,13 +274,14 @@ def cmd_convert(args: argparse.Namespace) -> int:
     work = _work_root(args)
     settings = _settings_from_args(args)
 
-    scan = ScanSession(
+    scan_session = ScanSession(
         install,
         work,
         mount_mode=args.link_mode,
         null_rhi=not args.no_nullrhi,
         on_progress=None if args.json else lambda msg, frac: _log.info("%s", msg),
-    ).run(args.content_root)
+    )
+    scan = scan_session.run(args.content_root)
 
     selection = _select_groups(scan, args.group or [], args.all)
     if not selection:
@@ -295,7 +300,9 @@ def cmd_convert(args: argparse.Namespace) -> int:
     )
 
     report = ExportSession(
-        install,
+        # Reuse the engine the scan settled on: a project declaring 5.4 must
+        # not be exported with a newer editor.
+        scan_session.install,
         plan,
         on_progress=None if args.json else lambda msg, frac: _log.info("%s", msg),
         on_event=None,
