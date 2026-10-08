@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QTextCursor
+from PyQt5.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PyQt5.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -122,7 +122,12 @@ class PathPicker(QWidget):
 
 
 class LogView(QPlainTextEdit):
-    """Read-only, colour-coded log pane."""
+    """Read-only, colour-coded log pane.
+
+    ``QPlainTextEdit`` does **not** have ``setTextColor`` -- that belongs to
+    ``QTextEdit``. Colour therefore has to travel with each insertion, via a
+    ``QTextCharFormat`` handed to the cursor.
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -135,16 +140,20 @@ class LogView(QPlainTextEdit):
         self.setFont(font)
         self.setPlaceholderText("转换日志将显示在这里…")
 
+    def _append(self, text: str, color: str) -> None:
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(f"{text}\n", fmt)
+        self.setTextCursor(cursor)
+        self.ensureCursorVisible()
+
     def append_line(self, level: int, text: str) -> None:
-        color = _LEVEL_COLORS.get(level, "#111827")
-        self.setTextColor(QColor(color))
-        self.appendPlainText(text)
-        self.moveCursor(QTextCursor.End)
+        self._append(text, _LEVEL_COLORS.get(level, "#111827"))
 
     def append_plain(self, text: str, color: str | None = None) -> None:
-        self.setTextColor(QColor(color or COLOR_MUTED))
-        self.appendPlainText(text)
-        self.moveCursor(QTextCursor.End)
+        self._append(text, color or COLOR_MUTED)
 
     def clear_log(self) -> None:
         self.clear()

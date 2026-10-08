@@ -115,11 +115,13 @@ class MainWindow(QMainWindow):
         # --- logging into the run page --------------------------------------
         self._log_bridge = _LogBridge()
         self._log_bridge.message.connect(self.run_page.append_log)
-        handler = CallbackHandler(
+        self._log_handler = CallbackHandler(
             lambda level, text: self._log_bridge.message.emit(level, text)
         )
-        handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
-        logging.getLogger("fbxconv").addHandler(handler)
+        self._log_handler.setFormatter(
+            logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+        )
+        logging.getLogger("fbxconv").addHandler(self._log_handler)
 
         self.go_to(0)
 
@@ -359,6 +361,9 @@ class MainWindow(QMainWindow):
             if worker is not None and worker.isRunning():
                 worker.cancel()
                 worker.wait(5000)
+        # Detach the log handler, otherwise a closed window keeps receiving
+        # records and holding references to its deleted widgets.
+        logging.getLogger("fbxconv").removeHandler(self._log_handler)
         try:
             self.config.save()
         except OSError as exc:  # pragma: no cover

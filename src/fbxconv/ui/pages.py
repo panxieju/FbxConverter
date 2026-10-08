@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 
 from PyQt5.QtCore import Qt
@@ -894,7 +895,15 @@ class RunPage(WizardPage):
         self.open_button.setEnabled(True)
 
     def append_log(self, level: int, text: str) -> None:
-        self.log_view.append_line(level, text)
+        """Render one log record.
+
+        This runs from a Qt slot, so an escaping exception aborts the whole
+        process (PyQt5 calls ``qFatal``). Losing a log line is always
+        preferable to losing the session, so failures are swallowed -- the
+        record has already reached the console and file handlers anyway.
+        """
+        with contextlib.suppress(Exception):
+            self.log_view.append_line(level, text)
 
 
 __all__ = [
