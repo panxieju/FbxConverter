@@ -36,9 +36,12 @@ coverage.xml
 # --- This tool's own output -------------------------------------------------
 # Default export destination and scratch area (see fbxconv.config).
 UnityExport/
+UnityExport.meta
 .fbxconv/
 .scratch/
 .verify/
+# Ad-hoc verification projects/scratch: .verify-escape, .verify-unity, ...
+.verify*/
 Reports/export_report.json
 Reports/unity_import_report.json
 
