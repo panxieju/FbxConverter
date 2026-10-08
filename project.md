@@ -64,11 +64,11 @@ FBX 包，并把 Unity 侧的导入配置与校验一并自动化。
 | `config.py` | 用户配置持久化（`%APPDATA%/FbxConverter/config.json`） | `AppConfig` |
 | `logutil.py` | 统一日志 + 回调 Handler（喂给 GUI 日志面板） | `configure_logging` `CallbackHandler` |
 | `report.py` | 导出报告 | `ExportReport` |
-| `unreal/locator.py` | 注册表 / Launcher / 目录扫描定位引擎，并**校验可执行文件存在** | `UnrealInstall` |
+| `unreal/locator.py` | 注册表 / Launcher / 目录扫描定位引擎，并**校验可执行文件存在**；按 `.uproject` 的 `EngineAssociation` 选引擎 | `UnrealInstall` `resolve_install_for_project` `project_engine_association` |
 | `unreal/project.py` | 独立转换项目：生成 `.uproject` + 挂载 `Content` | `ConversionProject` `MountMode` |
 | `unreal/paths.py` | 文件系统 ↔ Unreal 包路径换算 | `to_package_path` `package_to_object` … |
 | `unreal/runner.py` | 无头启动编辑器、传递 job、回收 result、流式事件、取消 | `UnrealRunner` `UnrealScriptResult` |
-| `pipeline/scan.py` | 发现 → Unreal 确认 → 按骨架分组 | `ScanSession` `group_assets` |
+| `pipeline/scan.py` | 发现 → 定范围 → Unreal 确认 → 按骨架分组 → 依赖诊断 | `ScanSession` `group_assets` `diagnose_dependencies` |
 | `pipeline/export.py` | 计划 → 单次批量导出 → 写产物 | `ExportSession` `build_plan` |
 | `unity/manifest.py` | 生成 `manifest.json` / `profile.json`，投放 Editor 脚本 | `build_profile_payload` `install_unity_support` |
 | `unity/runner.py` | 定位并批处理驱动 Unity/团结引擎 | `UnityInstall` `run_batch_import` |
@@ -180,7 +180,9 @@ Unreal 侧 `print("FBXCONV:" + json)`，主机按前缀解析并转发给 UI：
 
 ```jsonc
 // job
-{ "mount_point": "/Game", "deep_resolve": true, "max_assets": 200000 }
+{ "mount_point": "/Game",
+  "scope_prefix": "/Game/CLazyAnimpack",   // 只报告该子树；空 = 整个挂载点
+  "deep_resolve": true, "max_assets": 200000 }
 ```
 
 ```jsonc
@@ -386,6 +388,28 @@ EditMode 测试的投放由 Python 决策（检查 `Packages/manifest.json` /
 
 后者才是有用的信号：原地循环动画通常有垂直起伏但没有水平位移。
 
+### 6.12 `manifest.json` 不能带 BOM
+
+实测：用 PowerShell 的 `Set-Content -Encoding UTF8` 改写 Unity 的
+`Packages/manifest.json` 会写入 BOM（`EF BB BF`），**Unity 会直接忽略该文件**——
+不报错、不提示，只是什么都不做，看起来像“改了没用”。
+
+用无 BOM 的 UTF-8 重写后同一份内容立刻生效。任何自动化改写
+`manifest.json` / `packages-lock.json` 的代码都必须显式写 UTF-8 without BOM。
+
+### 6.13 GUI 槽函数异常会终止整个进程
+
+PyQt5 从 C++ 调用 Python 槽函数时，逃逸的异常不会只是打印堆栈，而是走到
+`qFatal` → 进程以 `0xC0000409` 结束。曾因 `QPlainTextEdit` 误用
+`setTextColor`（那是 `QTextEdit` 的方法）导致一开界面就崩。
+
+规则：**槽函数内部不假设任何东西都正常**。日志面板这类“尽力而为”的 UI
+用 `contextlib.suppress` 包住，丢一行日志远好过丢整个会话。
+
+另：该 bug 逃过了最初的离屏冒烟测试，因为那个测试没有调用
+`configure_logging()`，日志级别停在 WARNING，记录从未进到面板——
+`tests/test_ui_logging.py` 现在专门驱动这条链路。
+
 ---
 
 ## 7. 目录结构
@@ -413,7 +437,15 @@ FbxConverter/
     ue_scripts/                → 在 Unreal 内执行
       fbxconv_common.py  fbxconv_scan.py  fbxconv_export.py
     ui/{app,main_window,pages,widgets,worker,__init__}.py
-  tests/                       87 个单元测试
+  tests/                       114 个单元测试
+    test_discover.py           目录解析、.uproject 查找、伴随文件
+    test_paths.py              包路径换算、文件名净化与去重
+    test_models.py             资源分类、骨架分组、同名消歧、空组过滤
+    test_engine_selection.py   引擎版本跟随声明、扫描范围推导
+    test_artefacts.py          profile/manifest/report 生成、配置持久化
+    test_diagnostics.py        挂载点不匹配诊断
+    test_unity_install.py      Editor 脚本投放与 Test Framework 门控
+    test_ui_logging.py         GUI 日志链路（曾在真实运行时崩过）
 ```
 
 ---
@@ -455,6 +487,42 @@ python -m ruff check src tests run.py packaging
 ```
 scan(17s) → export(26s) → unity-import(13s)
 ```
+
+### 8.4 用 Unity MCP 在**运行中的**编辑器里验证
+
+批处理导入（§4.3）需要独占工程，且看不到界面。若编辑器已经开着，
+装一次 [MCP for Unity](https://github.com/CoplayDev/unity-mcp) 就能直接在活的
+编辑器里跑导入、读 API、截图，省掉反复重启：
+
+```powershell
+# 作为 embedded package 投放（比 file: 引用更自包含）
+Copy-Item H:\Downloads\unity-mcp-main\MCPForUnity `
+          <UnityProject>\Packages\com.coplaydev.unity-mcp -Recurse
+```
+
+Unity 需要重新解析包才会编译。若编辑器在后台，它**不会主动刷新**；
+用 MCP 的 `refresh_unity(mode="force", compile="request")` 推一把即可。
+桥接起来后监听 `127.0.0.1:6400`。
+
+验证时**不要只读自己写的报告**，用 Unity 自己的 API 交叉核对：
+
+```csharp
+// 尺寸与轴向：直接读 SkinnedMeshRenderer.bounds
+var smr = inst.GetComponentInChildren<SkinnedMeshRenderer>();
+smr.bounds.size;                    // 应为 (1.41, 1.83, 0.44) 米，Y 最大
+
+// Avatar
+avatar.isValid / avatar.isHuman / avatar.humanDescription.human.Length
+
+// 根运动：用引擎算好的平均速度，而不是自己扫曲线
+clip.averageSpeed;                  // Vector3，单位 m/s
+```
+
+`AnimationClip.averageSpeed` 是这里的关键——它是 Unity 对根运动的权威解释，
+比自己解析 `RootT`/`m_LocalPosition` 曲线可靠得多（见 §6.11）。
+
+在场景里临时实例化 → `manage_scene scene_view_frame` → 截图 → 删除，
+可以既拿到目视确认，又不留改动。
 
 ---
 
@@ -517,3 +585,19 @@ dist\FbxConverter\FbxConverter.exe
 | 无跨骨架重定向 | 不同骨架需分别导出 | 接入 IK Retargeter |
 | `Rigs/Poses/*_anim` 会被当作普通动画列出 | 选择列表偏长 | 依据 ControlRig 归属自动分组或默认折叠 |
 | `.pak/.utoc/.ucas` 不支持 | 打包资源需先解包 | 集成 UnrealPak 解包前置步骤 |
+| 输出把动作平铺在 `Animations/` 下 | 源目录的 `Root_motion/` 等分组会丢失（同名靠后缀消解） | 提供“保留源子目录结构”选项 |
+
+---
+
+## 11. 验证记录
+
+三套真实素材上的端到端结果，作为回归基线：
+
+| 场景 | 结果 |
+|---|---|
+| UE 模板 Mannequin（UE 5.8，独立目录） | 145 资源 / 3 组；42 个 FBX 一次导出 25.8s；2/2 角色通过，高度 1.813 / 1.833 m，Y(up) |
+| `Escape` 工程 `CLazyAnimpack`（UE 5.4，真实工程） | 声明 5.4 自动改用 5.4（默认会选 5.8）；范围收敛到 `/Game/CLazyAnimpack` → 300 资源；**213/213** 导出（1 网格 + 212 动画，44.9s） |
+| 同上，导入编辑器内的 Tuanjie 工程 | 1/1 通过；`SkinnedMeshRenderer.bounds` = (1.4075, **1.8329**, 0.4352) m，最高轴 Y；Avatar 有效且为人形（52 骨）；212 个剪辑 0 失败；根运动经 `averageSpeed` 确认为非零 m/s |
+
+最后一项是用 §8.4 的 MCP 方式在**用户已打开的编辑器**里验证的，
+不是批处理——两者结论一致。

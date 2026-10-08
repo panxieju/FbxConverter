@@ -42,6 +42,8 @@ UnityExport.meta
 .verify/
 # Ad-hoc verification projects/scratch: .verify-escape, .verify-unity, ...
 .verify*/
+# Explicit --work targets: .work-escape, .work-*, ...
+.work*/
 Reports/export_report.json
 Reports/unity_import_report.json
 
