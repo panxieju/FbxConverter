@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import posixpath
 import shutil
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from ..models import (
     RootMotionMode,
     ScanResult,
 )
+from ..unreal.paths import unique_posix
 
 _log = get_logger("unity.manifest")
 
@@ -217,16 +219,165 @@ def build_profile_payload(
     }
 
 
+def _unique_texture_names(packages: Sequence[str]) -> dict[str, str]:
+    """Stable, human-readable key for each texture package.
+
+    ``/Game/PackA/Textures/T_Rock`` and ``/Game/PackB/Textures/T_Rock`` are
+    different assets, so a bare basename is not enough to key the table.
+    """
+    names: dict[str, str] = {}
+    taken: set[str] = set()
+    for package in sorted(packages):
+        base = posixpath.basename(package) or "Texture"
+        candidate = unique_posix(base, taken)
+        names[package] = candidate
+    return names
+
+
+def material_name_collisions(materials: Sequence[str]) -> list[str]:
+    """Unreal materials whose asset names clash inside one export.
+
+    Unity binds materials to a model **by name**, so two different Unreal
+    materials called ``M_Rock`` cannot both be represented. Reporting it is the
+    only honest option: silently merging them would mis-texture one of them.
+    """
+    by_name: dict[str, list[str]] = {}
+    for package in dict.fromkeys(materials):
+        by_name.setdefault(posixpath.basename(package), []).append(package)
+    return [
+        "材质同名冲突（Unity 按名绑定，只能保留一个）："
+        + ", ".join(sorted(packages))
+        for name, packages in sorted(by_name.items())
+        if len(packages) > 1
+    ]
+
+
+def build_static_materials(
+    plan: ConversionPlan,
+    *,
+    texture_metadata: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, int],
+]:
+    """Build the texture table, material table and per-mesh entries.
+
+    Returns ``(textures, materials, meshes, summary)``. The first two are
+    referenced by name / index so ``manifest.json`` stays a size Unity's
+    ``JsonUtility`` can chew through even for a 2000-mesh pack.
+    """
+    metadata = dict(texture_metadata or {})
+    names = _unique_texture_names(list(metadata))
+
+    texture_table: list[dict[str, Any]] = []
+    for package in sorted(metadata):
+        entry = metadata[package]
+        texture_table.append(
+            {
+                "name": names[package],
+                "path": str(entry.get("output_rel") or ""),
+                "unrealPackage": package,
+                "srgb": bool(entry.get("srgb", True)),
+                "textureType": str(entry.get("texture_kind") or "baseColor"),
+                "unrealClass": str(entry.get("class") or "Texture2D"),
+                "bytes": int(entry.get("size") or 0),
+                "width": int(entry.get("width") or 0),
+                "height": int(entry.get("height") or 0),
+            }
+        )
+
+    # material package -> ordered texture packages, taken from any mesh that
+    # uses it (the scan records the mapping per slot).
+    material_textures: dict[str, list[str]] = {}
+    for plan_group in plan.groups:
+        for mesh in plan_group.group.meshes:
+            for slot in mesh.extra.get("material_slots") or []:
+                material = str(slot.get("material") or "")
+                if not material or material in material_textures:
+                    continue
+                material_textures[material] = [
+                    str(t) for t in (slot.get("textures") or []) if t in names
+                ]
+
+    material_index: dict[str, int] = {}
+    material_table: list[dict[str, Any]] = []
+    for material in sorted(material_textures):
+        assigned = {"baseColor": "", "normal": "", "mask": ""}
+        for texture in material_textures[material]:
+            kind = str((metadata.get(texture) or {}).get("texture_kind") or "baseColor")
+            if kind in assigned and not assigned[kind]:
+                assigned[kind] = names[texture]
+        if not any(assigned.values()) and material_textures[material]:
+            # No usable role guess: hand the first texture to base colour so
+            # the model is not left untextured, and say so in the report.
+            assigned["baseColor"] = names[material_textures[material][0]]
+        material_index[material] = len(material_table)
+        material_table.append(
+            {
+                "name": posixpath.basename(material) or "Material",
+                "unrealMaterial": material,
+                "baseColor": assigned["baseColor"],
+                "normal": assigned["normal"],
+                "mask": assigned["mask"],
+                "allTextures": [names[t] for t in material_textures[material]],
+            }
+        )
+
+    meshes: list[dict[str, Any]] = []
+    for plan_group in plan.static_groups:
+        by_package = {m.package_path: m for m in plan_group.group.meshes}
+        for request in plan_group.mesh_requests:
+            record = by_package.get(request.package_path)
+            slots: list[dict[str, Any]] = []
+            if record is not None:
+                for slot in record.extra.get("material_slots") or []:
+                    material = str(slot.get("material") or "")
+                    if material not in material_index:
+                        continue
+                    slots.append(
+                        {
+                            "slotName": str(slot.get("slot") or ""),
+                            "materialIndex": material_index[material],
+                        }
+                    )
+            meshes.append(
+                {
+                    "name": request.display_name,
+                    "fbx": request.output_rel,
+                    "unrealPackage": request.package_path,
+                    "group": plan_group.output_name,
+                    "relativeDir": plan_group.group.relative_dir,
+                    "triangleHint": int(
+                        (record.extra.get("triangle_count") if record else 0) or 0
+                    ),
+                    "slotCount": len(slots),
+                    "slots": slots,
+                }
+            )
+
+    summary = {
+        "staticMeshCount": len(meshes),
+        "textureCount": len(texture_table),
+        "materialCount": len(material_table),
+    }
+    return texture_table, material_table, meshes, summary
+
+
 def build_manifest_payload(
     plan: ConversionPlan,
     *,
     profile_paths: dict[str, str],
     generated_at: str,
     report_path: str = "",
+    texture_metadata: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Top-level manifest tying every character and report together."""
+    """Top-level manifest tying every character, mesh and report together."""
     characters = []
     for plan_group in plan.groups:
+        if plan_group.is_static:
+            continue
         group = plan_group.group
         characters.append(
             {
@@ -246,6 +397,10 @@ def build_manifest_payload(
                 "missingDependencies": list(group.missing_dependencies),
             }
         )
+
+    textures, materials, static_meshes, static_summary = build_static_materials(
+        plan, texture_metadata=texture_metadata
+    )
 
     return {
         "schemaVersion": SCHEMA_VERSION,
@@ -268,12 +423,19 @@ def build_manifest_payload(
             "rootMotion": plan.settings.root_motion.value,
             "scale": float(plan.settings.scale),
             "exportMaterials": bool(plan.settings.export_materials),
+            "exportTextures": bool(plan.settings.export_textures),
         },
         "importerScript": f"Editor/{IMPORTER_FILENAME}",
         "reportPath": report_path,
         "characterCount": len(characters),
         "animationCount": sum(len(g.animation_requests) for g in plan.groups),
         "characters": characters,
+        "textures": textures,
+        "materials": materials,
+        "staticMeshes": static_meshes,
+        "staticMeshCount": static_summary["staticMeshCount"],
+        "textureCount": static_summary["textureCount"],
+        "materialCount": static_summary["materialCount"],
     }
 
 
@@ -415,9 +577,11 @@ __all__ = [
     "TESTS_FILENAME",
     "build_manifest_payload",
     "build_profile_payload",
+    "build_static_materials",
     "find_enclosing_project",
     "infer_loop",
     "install_unity_support",
+    "material_name_collisions",
     "project_has_test_framework",
     "resolve_loop",
     "templates_dir",

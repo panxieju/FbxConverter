@@ -28,6 +28,7 @@ from .errors import FbxConvError
 from .logutil import configure_logging, get_logger
 from .models import (
     ExportSettings,
+    GroupKind,
     GroupStatus,
     ImportType,
     LoopMode,
@@ -97,6 +98,11 @@ def _add_settings(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--scale", type=float, default=1.0, help="Unity 导入缩放")
     parser.add_argument("--no-materials", action="store_true", help="不导入材质槽")
+    parser.add_argument(
+        "--no-textures",
+        action="store_true",
+        help="导出静态网格时不导出所用贴图（默认会导出 PNG 并交给 Unity 自动装配）",
+    )
 
 
 def _install_from_args(args: argparse.Namespace) -> UnrealInstall:
@@ -123,6 +129,7 @@ def _settings_from_args(args: argparse.Namespace) -> ExportSettings:
         root_motion=RootMotionMode(args.root_motion),
         scale=float(args.scale),
         export_materials=not args.no_materials,
+        export_textures=not getattr(args, "no_textures", False),
     )
 
 
@@ -133,11 +140,17 @@ def _work_root(args: argparse.Namespace) -> Path:
 
 
 def _select_groups(
-    scan: ScanResult, names: Sequence[str], take_all: bool
+    scan: ScanResult,
+    names: Sequence[str],
+    take_all: bool,
+    *,
+    kinds: Sequence[GroupKind] | None = None,
 ) -> list[SelectedGroup]:
     """Resolve ``--group`` filters (substring, case-insensitive) into a selection."""
     selected: list[SelectedGroup] = []
     for group in scan.groups:
+        if kinds and group.kind not in kinds:
+            continue
         output_name = group_output_name(group)
         if group.status is GroupStatus.MISSING_DEPS:
             _log.warning("跳过 %s：存在缺失依赖", output_name)
@@ -154,10 +167,23 @@ def _select_groups(
             continue
         selected.append(
             SelectedGroup(
-                group=group, mesh=group.reference_mesh, animations=list(group.animations)
+                group=group,
+                mesh=group.reference_mesh,
+                animations=list(group.animations),
+                meshes=list(group.meshes) if group.is_static else [],
             )
         )
     return selected
+
+
+def _kind_filter(args: argparse.Namespace) -> list[GroupKind] | None:
+    """Which group kinds the user asked for (default: whatever was found)."""
+    mode = getattr(args, "mode", "all")
+    if mode == "skeletal":
+        return [GroupKind.SKELETAL]
+    if mode == "static":
+        return [GroupKind.STATIC]
+    return None
 
 
 def _print_scan(scan: ScanResult) -> None:
@@ -170,16 +196,27 @@ def _print_scan(scan: ScanResult) -> None:
         print(f"转换项目   : {scan.conversion_project}")
     print(f"引擎版本   : {scan.engine_version}")
     print(f"资源文件   : {scan.file_count} 个（确认 {len(scan.assets)} 个）")
+    print(
+        f"内容统计   : 骨骼组 {len(scan.skeletal_groups)}，"
+        f"静态组 {len(scan.static_groups)}，"
+        f"网格 {scan.total_meshes}，动画 {scan.total_animations}，"
+        f"贴图 {scan.total_textures}"
+    )
     for warning in scan.warnings:
         print(f"  警告: {warning}")
     print()
-    print(f"{'骨架组':<40}{'参考网格':<24}{'动画':>5}  {'状态':<10}输出目录")
-    print("-" * 100)
+    print(f"{'类型':<8}{'组':<38}{'参考网格':<24}{'动画':>5}{'网格':>6}  {'状态':<10}输出目录")
+    print("-" * 116)
     for group in scan.groups:
         mesh = group.reference_mesh.name if group.reference_mesh else "-"
+        if group.is_static:
+            location = f"StaticMeshes/{group.relative_dir}".rstrip("/")
+        else:
+            location = group_output_name(group)
         print(
-            f"{(group.display_name or '-')[:39]:<40}{mesh[:23]:<24}"
-            f"{group.animation_count:>5}  {group.status.label:<10}{group_output_name(group)}"
+            f"{group.kind.label:<8}{(group.display_name or '-')[:37]:<38}"
+            f"{mesh[:23]:<24}{group.animation_count:>5}{group.mesh_count:>6}  "
+            f"{group.status.label:<10}{location}"
         )
         if group.missing_dependencies:
             for dep in group.missing_dependencies[:5]:
@@ -248,13 +285,23 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     "scope_prefix": scan.scope_prefix,
                     "file_count": scan.file_count,
                     "warnings": scan.warnings,
+                    "counts": {
+                        "skeletal_groups": len(scan.skeletal_groups),
+                        "static_groups": len(scan.static_groups),
+                        "meshes": scan.total_meshes,
+                        "animations": scan.total_animations,
+                        "textures": scan.total_textures,
+                    },
                     "groups": [
                         {
                             "display_name": g.display_name,
                             "output_name": group_output_name(g),
+                            "kind": g.kind.value,
+                            "relative_dir": g.relative_dir,
                             "status": g.status.value,
                             "meshes": [m.name for m in g.meshes],
                             "animation_count": g.animation_count,
+                            "texture_count": g.texture_count,
                             "missing_dependencies": g.missing_dependencies,
                         }
                         for g in scan.groups
@@ -283,9 +330,14 @@ def cmd_convert(args: argparse.Namespace) -> int:
     )
     scan = scan_session.run(args.content_root)
 
-    selection = _select_groups(scan, args.group or [], args.all)
+    selection = _select_groups(
+        scan, args.group or [], args.all, kinds=_kind_filter(args)
+    )
     if not selection:
-        _log.error("没有选中的骨架组。使用 --all 或 --group <名称>。")
+        _log.error(
+            "没有选中的转换组。使用 --all 或 --group <名称>；"
+            "可用 --mode skeletal|static 限定类型。"
+        )
         if not args.json:
             _print_scan(scan)
         return EXIT_ERROR
@@ -418,8 +470,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("convert", help="扫描并导出 FBX（主命令）")
     _add_common(p)
     _add_settings(p)
-    p.add_argument("--group", action="append", metavar="NAME", help="按名称选择骨架组（可重复）")
-    p.add_argument("--all", action="store_true", help="转换所有可用的骨架组")
+    p.add_argument("--group", action="append", metavar="NAME", help="按名称选择组（可重复）")
+    p.add_argument("--all", action="store_true", help="转换所有可用的组")
+    p.add_argument(
+        "--mode",
+        choices=("all", "skeletal", "static"),
+        default="all",
+        help="限定内容类型：骨骼动画 / 静态网格 / 全部（默认 all）",
+    )
     p.add_argument("--unity-project", metavar="DIR", help="同时把 Editor 脚本安装到该项目")
     p.add_argument("--unity-import", action="store_true", help="导出后立即执行 Unity 批处理导入")
     p.add_argument("--project", metavar="DIR", help="配合 --unity-import 的 Unity 项目目录")

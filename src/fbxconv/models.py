@@ -24,6 +24,7 @@ class AssetKind(str, Enum):
     """Normalised asset category, derived from the Unreal class name."""
 
     SKELETAL_MESH = "skeletal_mesh"
+    STATIC_MESH = "static_mesh"
     SKELETON = "skeleton"
     ANIM_SEQUENCE = "anim_sequence"
     ANIM_MONTAGE = "anim_montage"
@@ -42,12 +43,17 @@ class AssetKind(str, Enum):
 
     @property
     def is_exportable(self) -> bool:
-        """Only these two kinds produce an FBX in version 1."""
-        return self in (AssetKind.SKELETAL_MESH, AssetKind.ANIM_SEQUENCE)
+        """Only these kinds produce an FBX."""
+        return self in (
+            AssetKind.SKELETAL_MESH,
+            AssetKind.STATIC_MESH,
+            AssetKind.ANIM_SEQUENCE,
+        )
 
 
 _KIND_LABELS: dict[AssetKind, str] = {
     AssetKind.SKELETAL_MESH: "Skeletal Mesh",
+    AssetKind.STATIC_MESH: "Static Mesh",
     AssetKind.SKELETON: "Skeleton",
     AssetKind.ANIM_SEQUENCE: "Animation Sequence",
     AssetKind.ANIM_MONTAGE: "Animation Montage",
@@ -64,6 +70,7 @@ _KIND_LABELS: dict[AssetKind, str] = {
 #: Unreal class name (with or without the ``U``/``A`` prefix) -> normalised kind.
 _CLASS_TO_KIND: dict[str, AssetKind] = {
     "SkeletalMesh": AssetKind.SKELETAL_MESH,
+    "StaticMesh": AssetKind.STATIC_MESH,
     "Skeleton": AssetKind.SKELETON,
     "AnimSequence": AssetKind.ANIM_SEQUENCE,
     "AnimSequenceBase": AssetKind.ANIM_SEQUENCE,
@@ -243,14 +250,44 @@ class GroupStatus(str, Enum):
         }[self]
 
 
+class GroupKind(str, Enum):
+    """What a conversion group is built around.
+
+    Both kinds share :class:`SkeletonGroup` because the selection UI, the plan
+    and the exporter all treat "a named folder holding some FBX" identically.
+    """
+
+    SKELETAL = "skeletal"
+    """One Skeleton plus the meshes and animations bound to it."""
+
+    STATIC = "static"
+    """One Content folder's worth of StaticMeshes, which have no skeleton."""
+
+    @property
+    def label(self) -> str:
+        return {
+            GroupKind.SKELETAL: "骨骼动画",
+            GroupKind.STATIC: "静态网格",
+        }[self]
+
+
 @dataclass
 class SkeletonGroup:
-    """One Skeleton plus every mesh/animation bound to it."""
+    """One conversion group: a Skeleton's meshes/animations, or a static folder."""
 
     skeleton_path: str | None
     display_name: str
     output_name: str = ""
     """Folder name used under ``UnityExport/Characters/``."""
+
+    kind: GroupKind = GroupKind.SKELETAL
+
+    relative_dir: str = ""
+    """Content-relative folder, used to mirror the source layout.
+
+    Static groups keep the Unreal folder structure so a 2000-mesh pack does not
+    land in one flat directory.
+    """
 
     meshes: list[AssetRecord] = field(default_factory=list)
     animations: list[AssetRecord] = field(default_factory=list)
@@ -259,6 +296,10 @@ class SkeletonGroup:
     textures: list[AssetRecord] = field(default_factory=list)
     missing_dependencies: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def is_static(self) -> bool:
+        return self.kind is GroupKind.STATIC
 
     @property
     def status(self) -> GroupStatus:
@@ -276,11 +317,24 @@ class SkeletonGroup:
     def reference_mesh(self) -> AssetRecord | None:
         return self.meshes[0] if self.meshes else None
 
+    @property
+    def mesh_count(self) -> int:
+        return len(self.meshes)
+
+    @property
+    def texture_count(self) -> int:
+        seen: set[str] = set()
+        for mesh in self.meshes:
+            seen.update(mesh.textures)
+        return len(seen)
+
     def to_payload(self) -> dict[str, Any]:
         return {
             "skeleton_path": self.skeleton_path,
             "display_name": self.display_name,
             "output_name": self.output_name or self.display_name,
+            "kind": self.kind.value,
+            "relative_dir": self.relative_dir,
             "status": self.status.value,
             "meshes": [m.to_payload() for m in self.meshes],
             "animations": [a.to_payload() for a in self.animations],
@@ -333,6 +387,26 @@ class ScanResult:
     def total_meshes(self) -> int:
         return sum(len(g.meshes) for g in self.groups)
 
+    @property
+    def skeletal_groups(self) -> list[SkeletonGroup]:
+        return [g for g in self.groups if not g.is_static]
+
+    @property
+    def static_groups(self) -> list[SkeletonGroup]:
+        return [g for g in self.groups if g.is_static]
+
+    @property
+    def total_static_meshes(self) -> int:
+        return sum(len(g.meshes) for g in self.static_groups)
+
+    @property
+    def total_textures(self) -> int:
+        seen: set[str] = set()
+        for group in self.static_groups:
+            for mesh in group.meshes:
+                seen.update(mesh.textures)
+        return len(seen)
+
     def group_by_name(self, name: str) -> SkeletonGroup | None:
         for group in self.groups:
             if group.display_name == name:
@@ -377,6 +451,7 @@ class ExportSettings:
     root_motion: RootMotionMode = RootMotionMode.KEEP
     scale: float = 1.0
     export_materials: bool = True
+    export_textures: bool = True
     include_physics_asset: bool = False
 
     def to_payload(self) -> dict[str, Any]:
@@ -387,6 +462,7 @@ class ExportSettings:
             "root_motion": self.root_motion.value,
             "scale": float(self.scale),
             "export_materials": bool(self.export_materials),
+            "export_textures": bool(self.export_textures),
             "include_physics_asset": bool(self.include_physics_asset),
         }
 
@@ -407,6 +483,7 @@ class ExportSettings:
             root_motion=_enum(RootMotionMode, payload.get("root_motion"), RootMotionMode.KEEP),
             scale=float(payload.get("scale", 1.0) or 1.0),
             export_materials=bool(payload.get("export_materials", True)),
+            export_textures=bool(payload.get("export_textures", True)),
             include_physics_asset=bool(payload.get("include_physics_asset", False)),
         )
 
@@ -484,12 +561,53 @@ class ExportOutcome:
 
 
 @dataclass
+class TextureRequest:
+    """One texture to materialise as a PNG next to the exported meshes.
+
+    Unreal's FBX exporter only ever *references* textures, and it records the
+    original authoring path (``U:/Dropbox/...``), which does not exist on the
+    machine doing the conversion. So the bytes have to be exported separately
+    and handed to Unity alongside the FBX.
+    """
+
+    package_path: str
+    output_rel: str
+    """Destination ``.png`` path relative to the Unity export root."""
+
+    srgb: bool = True
+    texture_kind: str = "unknown"
+    """``baseColor`` / ``normal`` / ``mask`` / ``unknown``; drives Unity settings."""
+
+    display_name: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.display_name:
+            self.display_name = posixpath.basename(self.package_path)
+
+    @property
+    def kind(self) -> AssetKind:
+        """Lets a texture share :class:`ExportOutcome` with FBX requests."""
+        return AssetKind.TEXTURE
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "package_path": self.package_path,
+            "output_rel": self.output_rel,
+            "srgb": bool(self.srgb),
+            "texture_kind": self.texture_kind,
+            "display_name": self.display_name,
+        }
+
+
+@dataclass
 class SelectedGroup:
-    """A skeleton group the user chose to convert, with its checked animations."""
+    """A group the user chose to convert, with its checked contents."""
 
     group: SkeletonGroup
     mesh: AssetRecord | None = None
     animations: list[AssetRecord] = field(default_factory=list)
+    meshes: list[AssetRecord] = field(default_factory=list)
+    """Static meshes to export. Empty means "every mesh in the group"."""
 
     @property
     def output_name(self) -> str:
@@ -499,15 +617,27 @@ class SelectedGroup:
     def reference_mesh(self) -> AssetRecord | None:
         return self.mesh or self.group.reference_mesh
 
+    @property
+    def selected_meshes(self) -> list[AssetRecord]:
+        """Meshes to export: an explicit static selection, else the reference."""
+        if self.group.is_static:
+            return list(self.meshes) or list(self.group.meshes)
+        mesh = self.reference_mesh
+        return [mesh] if mesh is not None else []
+
 
 @dataclass
 class GroupPlan:
-    """A skeleton group selected for conversion."""
+    """A group selected for conversion."""
 
     group: SkeletonGroup
     output_name: str
     mesh_requests: list[ExportRequest] = field(default_factory=list)
     animation_requests: list[ExportRequest] = field(default_factory=list)
+
+    @property
+    def is_static(self) -> bool:
+        return self.group.is_static
 
     @property
     def all_requests(self) -> list[ExportRequest]:
@@ -529,6 +659,8 @@ class ConversionPlan:
     """The ``.uproject`` to launch Unreal with (see :attr:`ScanResult.unreal_project`)."""
 
     groups: list[GroupPlan] = field(default_factory=list)
+    texture_requests: list[TextureRequest] = field(default_factory=list)
+    texture_rel_by_package: dict[str, str] = field(default_factory=dict)
     engine_version: str = ""
     unity_project: Path | None = None
 
@@ -537,6 +669,22 @@ class ConversionPlan:
         out: list[ExportRequest] = []
         for group in self.groups:
             out.extend(group.all_requests)
+        return out
+
+    @property
+    def static_groups(self) -> list[GroupPlan]:
+        return [g for g in self.groups if g.is_static]
+
+    @property
+    def skeletal_groups(self) -> list[GroupPlan]:
+        return [g for g in self.groups if not g.is_static]
+
+    @property
+    def static_mesh_requests(self) -> list[ExportRequest]:
+        out: list[ExportRequest] = []
+        for group in self.groups:
+            if group.is_static:
+                out.extend(group.mesh_requests)
         return out
 
 
@@ -548,6 +696,7 @@ __all__ = [
     "ExportOutcome",
     "ExportRequest",
     "ExportSettings",
+    "GroupKind",
     "GroupPlan",
     "GroupStatus",
     "ImportType",
@@ -558,5 +707,6 @@ __all__ = [
     "SelectedGroup",
     "SkeletonGroup",
     "SourceFile",
+    "TextureRequest",
     "classify_class",
 ]

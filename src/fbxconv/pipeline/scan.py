@@ -22,6 +22,7 @@ from ..logutil import get_logger
 from ..models import (
     AssetKind,
     AssetRecord,
+    GroupKind,
     GroupStatus,
     ScanResult,
     SkeletonGroup,
@@ -165,12 +166,86 @@ def _missing_entries(record: AssetRecord) -> list[dict[str, str]]:
     return out
 
 
+def relative_dir(
+    package_path: str, mount_point: str, scope_prefix: str = ""
+) -> str:
+    """Folder of ``package_path`` relative to the scanned scope.
+
+    ``/Game/Pack/Meshes/Buildings/SM_X`` with scope ``/Game/Pack`` gives
+    ``Meshes/Buildings``. Mirroring this keeps a converted pack browsable
+    instead of dumping 2000 FBX into one directory.
+    """
+    base = (scope_prefix or mount_point or MOUNT_POINT).rstrip("/")
+    text = (package_path or "").rstrip("/")
+    if text == base:
+        return ""
+    text = text[len(base) + 1 :] if text.startswith(base + "/") else text.lstrip("/")
+    parts = [p for p in text.split("/") if p]
+    return "/".join(parts[:-1])
+
+
+def group_static_meshes(
+    meshes: Sequence[AssetRecord],
+    *,
+    mount_point: str = MOUNT_POINT,
+    scope_prefix: str = "",
+    taken: set[str] | None = None,
+) -> list[SkeletonGroup]:
+    """Bucket StaticMeshes by the Content folder they live in.
+
+    Static meshes have no skeleton, so the folder is the only grouping the
+    source data actually provides -- and it is the grouping a user browsing
+    Unity expects.
+    """
+    taken = taken if taken is not None else set()
+    buckets: dict[str, list[AssetRecord]] = {}
+    for mesh in meshes:
+        key = relative_dir(mesh.package_path, mount_point, scope_prefix)
+        buckets.setdefault(key, []).append(mesh)
+
+    base_label = posixpath.basename(
+        (scope_prefix or mount_point or MOUNT_POINT).rstrip("/")
+    )
+    groups: list[SkeletonGroup] = []
+    for folder in sorted(buckets, key=lambda k: (k.count("/"), k)):
+        members = sorted(buckets[folder], key=lambda m: m.name.lower())
+        if folder:
+            display = folder.split("/")[-1]
+            candidate = sanitise_filename(folder.replace("/", "_"), fallback="Static")
+        else:
+            display = base_label or "静态网格"
+            candidate = sanitise_filename(base_label, fallback="Static")
+        stem = candidate
+        index = 2
+        while candidate in taken:
+            candidate = f"{stem}_{index}"
+            index += 1
+        taken.add(candidate)
+
+        group = SkeletonGroup(
+            skeleton_path=None,
+            display_name=display,
+            output_name=candidate,
+            kind=GroupKind.STATIC,
+            relative_dir=folder,
+            meshes=members,
+        )
+        missing: dict[str, str] = {}
+        for mesh in members:
+            for entry in _missing_entries(mesh):
+                missing.setdefault(entry["package"], entry["expected_path"])
+        group.missing_dependencies = sorted(missing)
+        groups.append(group)
+    return groups
+
+
 def group_assets(
     assets: Iterable[AssetRecord],
     *,
     mount_point: str = MOUNT_POINT,
+    scope_prefix: str = "",
 ) -> list[SkeletonGroup]:
-    """Organise confirmed assets by the Skeleton they bind to."""
+    """Organise confirmed assets into skeletal groups and static folders."""
     asset_list = list(assets)
     by_kind: dict[AssetKind, list[AssetRecord]] = {}
     for asset in asset_list:
@@ -223,7 +298,7 @@ def group_assets(
 
     # Drop placeholder buckets that received nothing -- an "unlinked skeleton"
     # row with zero meshes and zero animations is pure noise in the UI.
-    groups = sorted(
+    skeletal = sorted(
         (g for g in buckets.values() if g.meshes or g.animations),
         key=lambda g: (
             g.skeleton_path is None,
@@ -233,19 +308,30 @@ def group_assets(
         ),
     )
 
-    _disambiguate_display_names(groups, mount_point)
+    _disambiguate_display_names(skeletal, mount_point)
 
     taken: set[str] = set()
-    for group in groups:
+    for group in skeletal:
         group.output_name = derive_group_name(
             group.skeleton_path, group.meshes, mount_point, taken
         )
 
+    static = group_static_meshes(
+        by_kind.get(AssetKind.STATIC_MESH, []),
+        mount_point=mount_point,
+        scope_prefix=scope_prefix,
+        taken=taken,
+    )
+    groups = [*skeletal, *static]
+
     _log.info(
-        "按骨架分组完成：%d 组（%d 网格 / %d 动画）",
+        "分组完成：%d 组（骨骼 %d / 静态 %d；%d 网格 / %d 动画 / %d 贴图）",
         len(groups),
+        len(skeletal),
+        len(static),
         sum(len(g.meshes) for g in groups),
         sum(len(g.animations) for g in groups),
+        sum(g.texture_count for g in static),
     )
     return groups
 
@@ -480,7 +566,9 @@ class ScanSession:
         data = result.require_ok()
 
         assets = [AssetRecord.from_payload(item) for item in data.get("assets", [])]
-        groups = group_assets(assets, mount_point=self.mount_point)
+        groups = group_assets(
+            assets, mount_point=self.mount_point, scope_prefix=self.scope_prefix
+        )
 
         warnings = list(result.warnings)
         if discovery.project_file is None:
@@ -496,7 +584,7 @@ class ScanSession:
         unresolved = [g for g in groups if g.status is GroupStatus.MISSING_DEPS]
         if unresolved:
             warnings.append(
-                f"{len(unresolved)} 个骨架组存在缺失依赖，详见各组“缺失依赖”列表。"
+                f"{len(unresolved)} 个转换组存在缺失依赖，详见各组“缺失依赖”列表。"
             )
         warnings.extend(diagnose_dependencies(assets, groups, self.mount_point))
 
@@ -518,10 +606,15 @@ class ScanSession:
         )
 
         _log.info(
-            "扫描完成：%d 个资源，%d 组，%d 个动画，用时 %.1fs",
+            "扫描完成：%d 个资源，%d 组（骨骼 %d / 静态 %d），"
+            "%d 网格，%d 动画，%d 贴图，用时 %.1fs",
             len(assets),
             len(groups),
+            len(scan.skeletal_groups),
+            len(scan.static_groups),
+            scan.total_meshes,
             scan.total_animations,
+            scan.total_textures,
             scan.scan_seconds,
         )
         return scan
@@ -535,4 +628,6 @@ __all__ = [
     "diagnose_dependencies",
     "group_assets",
     "group_output_name",
+    "group_static_meshes",
+    "relative_dir",
 ]

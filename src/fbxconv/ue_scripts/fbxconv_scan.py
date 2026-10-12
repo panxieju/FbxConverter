@@ -32,6 +32,18 @@ import fbxconv_common as common
 PROGRESS_EVERY = 50
 SKELETON_KINDS = ("SkeletalMesh", "AnimSequence", "AnimSequenceBase")
 MESH_KIND = "SkeletalMesh"
+STATIC_MESH_KIND = "StaticMesh"
+#: How deep to follow MaterialInstance -> parent Material when hunting textures.
+MATERIAL_DEPTH = 4
+TEXTURE_CLASS_HINTS = ("Texture",)  # Texture2D, TextureCube, TextureRenderTarget2D...
+#: Classes that can carry a texture further down the parent chain.
+MATERIAL_CLASSES = (
+    "Material",
+    "MaterialInstance",
+    "MaterialInstanceConstant",
+    "MaterialInstanceDynamic",
+    "MaterialFunction",
+)
 
 
 def _load(package_name, cache):
@@ -151,6 +163,107 @@ def _numeric(value):
     except (TypeError, ValueError):
         return None
     return number
+
+
+def _material_slots(obj):
+    """``[{"slot": name, "material": package}, ...]`` for a mesh.
+
+    ``SkeletalMesh.materials`` is a plain array of material interfaces, but
+    ``StaticMesh.static_materials`` is an array of ``StaticMaterial`` structs
+    that also carry the *slot name* -- which is what Unity shows and what the
+    FBX exporter names its material nodes after.
+    """
+    out = []
+    try:
+        slots = obj.get_editor_property("static_materials")
+    except Exception:
+        slots = None
+    if slots:
+        for entry in list(slots):
+            material = None
+            for getter in ("material_interface", "material"):
+                try:
+                    material = entry.get_editor_property(getter)
+                except Exception:
+                    continue
+                if material is not None:
+                    break
+            package = _package_of(material)
+            if not package:
+                continue
+            try:
+                slot_name = str(entry.get_editor_property("material_slot_name") or "")
+            except Exception:
+                slot_name = ""
+            out.append({"slot": slot_name, "material": package})
+        if out:
+            return out
+
+    # Fall back to the skeletal-mesh shape.
+    for package in _object_packages(obj, "materials"):
+        out.append({"slot": "", "material": package})
+    return out
+
+
+def _triangle_count(obj):
+    """Triangles in LOD 0, when the API is available."""
+    for method in ("get_num_triangles",):
+        try:
+            value = _numeric(getattr(obj, method)(0))
+        except Exception:
+            continue
+        if value and value > 0:
+            return int(round(value))
+    return None
+
+
+def _class_of_package(registry, package):
+    """Asset class recorded for ``package``, without loading it."""
+    try:
+        assets = registry.get_assets_by_package_name(package)
+    except Exception:
+        return None
+    for asset in assets or []:
+        name = common.asset_class_name(asset)
+        if name:
+            return name
+    return None
+
+
+def _textures_of_material(registry, package, options, class_cache):
+    """Texture packages reachable from a material, parents included.
+
+    ``MaterialEditingLibrary.get_used_textures`` looks like the obvious API but
+    returned an empty array for every material tested on 5.4 (it only walks
+    material *expressions*, and ``Material.expressions`` is protected from
+    Python). The AssetRegistry dependency graph has no such blind spot, so the
+    texture set is derived from it instead -- following
+    ``MaterialInstance -> parent Material`` a few levels.
+    """
+    textures = []
+    seen = set()
+    queue = [(package, 0)]
+    while queue:
+        current, level = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        for dependency in common.dependencies_of(registry, current, options):
+            if not dependency or dependency.startswith("/Script"):
+                continue
+            if dependency in class_cache:
+                class_name = class_cache[dependency]
+            else:
+                class_name = _class_of_package(registry, dependency)
+                class_cache[dependency] = class_name
+            if not class_name:
+                continue
+            if "Texture" in class_name:
+                if dependency not in textures:
+                    textures.append(dependency)
+            elif class_name in MATERIAL_CLASSES and level + 1 < MATERIAL_DEPTH:
+                queue.append((dependency, level + 1))
+    return textures
 
 
 def _frame_rate_of(obj):
@@ -349,6 +462,7 @@ def body(warnings):
             if obj is not None:
                 record["skeleton"] = _skeleton_of(obj) or record["skeleton"]
                 record["materials"] = _object_packages(obj, "materials")
+                record["extra"]["material_slots"] = _material_slots(obj)
                 record["physics_asset"] = _package_of(_property(obj, "physics_asset"))
                 try:
                     sockets = obj.get_editor_property("sockets")
@@ -359,6 +473,28 @@ def body(warnings):
                 value = tags["PhysicsAsset"]
                 if _is_package_path(value):
                     record["physics_asset"] = value.split(".")[0]
+
+        elif class_name == STATIC_MESH_KIND:
+            # A static mesh has no skeleton and no animation; what matters is
+            # which materials (and therefore which textures) come with it.
+            if obj is None and deep_resolve:
+                obj = _load(package_name, load_cache)
+                if obj is None:
+                    load_failures.append(package_name)
+            record["extra"]["deep_resolved"] = obj is not None
+            if obj is not None:
+                record["extra"]["material_slots"] = _material_slots(obj)
+                record["materials"] = [
+                    s["material"] for s in record["extra"]["material_slots"]
+                ]
+                triangles = _triangle_count(obj)
+                if triangles:
+                    record["extra"]["triangle_count"] = triangles
+                try:
+                    lods = obj.get_editor_property("lod_group")
+                    record["extra"]["lod_group"] = str(lods)
+                except Exception:
+                    pass
 
         elif class_name == "Skeleton":
             record["extra"]["is_group_root"] = True
@@ -394,7 +530,58 @@ def body(warnings):
             % (len(load_failures), ", ".join(load_failures[:10]))
         )
 
-    common.emit("phase", message="扫描完成", assets=len(records))
+    # --- material -> texture resolution ------------------------------------
+    # Done as one pass over the *union* of materials: a 2000-mesh pack usually
+    # shares a handful of materials, so resolving per mesh would repeat the
+    # same registry queries thousands of times.
+    material_packages = []
+    for record in records:
+        for material in record.get("materials") or []:
+            if material not in material_packages:
+                material_packages.append(material)
+
+    texture_classes = {}
+    textures_by_material = {}
+    if material_packages:
+        common.emit("phase", message="正在解析材质与贴图", total=len(material_packages))
+        for index, material in enumerate(material_packages):
+            textures_by_material[material] = _textures_of_material(
+                registry, material, options, texture_classes
+            )
+            if (index + 1) % PROGRESS_EVERY == 0 or index + 1 == len(material_packages):
+                common.emit(
+                    "progress",
+                    done=index + 1,
+                    total=len(material_packages),
+                    message="已解析 %d/%d 个材质" % (index + 1, len(material_packages)),
+                )
+
+        for record in records:
+            slots = record["extra"].get("material_slots") or []
+            if not slots:
+                continue
+            own = []
+            for slot in slots:
+                resolved = textures_by_material.get(slot.get("material")) or []
+                slot["textures"] = list(resolved)
+                for texture in resolved:
+                    if texture not in own:
+                        own.append(texture)
+            record["textures"] = own
+
+    texture_table = {
+        package: {"class": class_name}
+        for package, class_name in sorted(texture_classes.items())
+        if class_name and "Texture" in class_name
+    }
+
+    common.emit(
+        "phase",
+        message="扫描完成",
+        assets=len(records),
+        materials=len(material_packages),
+        textures=len(texture_table),
+    )
 
     return {
         "engine_version": engine_version,
@@ -403,6 +590,7 @@ def body(warnings):
         "scope_prefix": scope_prefix,
         "asset_count": len(records),
         "load_failures": load_failures,
+        "textures": texture_table,
         "assets": records,
     }
 

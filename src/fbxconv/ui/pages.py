@@ -299,8 +299,10 @@ class ScanPage(WizardPage):
             [
                 ("files", "资源文件"),
                 ("assets", "已确认资源"),
-                ("groups", "骨架组"),
+                ("groups", "转换组"),
+                ("static", "静态网格"),
                 ("animations", "动画数量"),
+                ("textures", "贴图数量"),
                 ("missing", "缺失依赖"),
             ]
         ):
@@ -315,10 +317,10 @@ class ScanPage(WizardPage):
         self.body.addWidget(summary)
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(5)
-        self.tree.setHeaderLabels(["骨架组", "参考网格", "动画", "状态", "输出目录"])
+        self.tree.setColumnCount(6)
+        self.tree.setHeaderLabels(["组", "参考网格", "动画", "状态", "类型", "输出位置"])
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.tree.header().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.tree.header().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.tree.setAlternatingRowColors(True)
         self.body.addWidget(self.tree, 1)
 
@@ -356,7 +358,9 @@ class ScanPage(WizardPage):
         self.summary_labels["files"].setText(str(scan.file_count))
         self.summary_labels["assets"].setText(str(len(scan.assets)))
         self.summary_labels["groups"].setText(str(len(scan.groups)))
+        self.summary_labels["static"].setText(str(scan.total_static_meshes))
         self.summary_labels["animations"].setText(str(scan.total_animations))
+        self.summary_labels["textures"].setText(str(scan.total_textures))
         missing_total = sum(len(g.missing_dependencies) for g in scan.groups)
         self.summary_labels["missing"].setText(str(missing_total))
         self.summary_labels["missing"].setStyleSheet(
@@ -367,19 +371,24 @@ class ScanPage(WizardPage):
 
         for group in scan.groups:
             mesh = group.reference_mesh.name if group.reference_mesh else "—"
+            if group.is_static:
+                location = f"StaticMeshes/{group.relative_dir}".rstrip("/")
+            else:
+                location = group_output_name(group)
             item = QTreeWidgetItem(
                 [
                     group.display_name or "—",
                     mesh,
                     str(group.animation_count),
                     group.status.label,
-                    group_output_name(group),
+                    group.kind.label,
+                    location,
                 ]
             )
             item.setForeground(3, QColor(_STATUS_COLORS.get(group.status, COLOR_MUTED)))
             self.tree.addTopLevelItem(item)
             for dependency in group.missing_dependencies:
-                child = QTreeWidgetItem(["", "", "", "缺失", dependency])
+                child = QTreeWidgetItem(["", "", "", "缺失", "", dependency])
                 child.setForeground(3, QColor(COLOR_ERROR))
                 item.addChild(child)
             item.setExpanded(bool(group.missing_dependencies))
@@ -394,14 +403,16 @@ class ScanPage(WizardPage):
 
 class SelectPage(WizardPage):
     title = "选择转换内容"
-    subtitle = "选择一个骨架组和参考网格，软件会自动勾选兼容动画，也可以手动取消部分动作。"
+    subtitle = (
+        "骨架组：选参考网格与动画；静态网格组：勾选要导出的网格（贴图会一并导出）。"
+    )
 
     def __init__(self, window: MainWindow, parent=None) -> None:
         super().__init__(window, parent)
 
         controls = QHBoxLayout()
         self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("过滤动画名称…")
+        self.filter_edit.setPlaceholderText("过滤名称…")
         self.filter_edit.textChanged.connect(self._apply_filter)
         controls.addWidget(QLabel("筛选"))
         controls.addWidget(self.filter_edit, 1)
@@ -422,9 +433,9 @@ class SelectPage(WizardPage):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(muted("骨架组（勾选要转换的组）"))
+        left_layout.addWidget(muted("转换组（勾选要转换的组）"))
         self.group_list = QTreeWidget()
-        self.group_list.setHeaderLabels(["骨架组", "网格", "动画", "状态"])
+        self.group_list.setHeaderLabels(["组", "网格", "动画", "状态", "类型"])
         self.group_list.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.group_list.setRootIsDecorated(False)
         self.group_list.itemChanged.connect(self._on_group_changed)
@@ -436,14 +447,17 @@ class SelectPage(WizardPage):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
-        mesh_row = QHBoxLayout()
+        self.mesh_row = QWidget()
+        mesh_row = QHBoxLayout(self.mesh_row)
+        mesh_row.setContentsMargins(0, 0, 0, 0)
         mesh_row.addWidget(QLabel("参考网格"))
         self.mesh_combo = QComboBox()
         self.mesh_combo.currentIndexChanged.connect(self._on_mesh_changed)
         mesh_row.addWidget(self.mesh_combo, 1)
-        right_layout.addLayout(mesh_row)
+        right_layout.addWidget(self.mesh_row)
 
-        right_layout.addWidget(muted("动画列表（取消勾选可排除动作）"))
+        self.list_label = muted("动画列表（取消勾选可排除动作）")
+        right_layout.addWidget(self.list_label)
         self.animation_list = QListWidget()
         self.animation_list.setSelectionMode(QAbstractItemView.NoSelection)
         self.animation_list.itemChanged.connect(self._on_animation_changed)
@@ -488,10 +502,13 @@ class SelectPage(WizardPage):
                     str(len(group.meshes)),
                     str(group.animation_count),
                     group.status.label,
+                    group.kind.label,
                 ]
             )
             item.setData(0, Qt.UserRole, index)
             item.setForeground(3, QColor(_STATUS_COLORS.get(group.status, COLOR_MUTED)))
+            if group.is_static:
+                item.setToolTip(0, f"静态网格目录：{group.relative_dir or '（根）'}")
             if selectable:
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(0, Qt.Checked)
@@ -504,6 +521,8 @@ class SelectPage(WizardPage):
                     else "该组没有参考网格",
                 )
             self.group_list.addTopLevelItem(item)
+        for column in (1, 2, 3, 4):
+            self.group_list.resizeColumnToContents(column)
 
         self.group_list.blockSignals(False)
         if self.group_list.topLevelItemCount():
@@ -537,6 +556,18 @@ class SelectPage(WizardPage):
             return
         group = scan.groups[index]
 
+        self.mesh_row.setVisible(not group.is_static)
+        self.loop_button.setVisible(not group.is_static)
+        if group.is_static:
+            self.filter_edit.setPlaceholderText("过滤网格名称…")
+            self.list_label.setText(
+                f"网格列表（共 {len(group.meshes)} 个，"
+                f"引用 {group.texture_count} 个贴图；取消勾选可排除）"
+            )
+        else:
+            self.filter_edit.setPlaceholderText("过滤动画名称…")
+            self.list_label.setText("动画列表（取消勾选可排除动作）")
+
         self.mesh_combo.blockSignals(True)
         self.mesh_combo.clear()
         for mesh in group.meshes:
@@ -550,19 +581,31 @@ class SelectPage(WizardPage):
 
         self.animation_list.blockSignals(True)
         self.animation_list.clear()
-        for animation in group.animations:
-            label = animation.name
-            if animation.duration:
-                label += f"   {animation.duration:.2f}s"
-            if animation.num_frames:
-                label += f" / {animation.num_frames} 帧"
-            if infer_loop(animation.name):
-                label += "   [循环]"
-            entry = QListWidgetItem(label)
-            entry.setFlags(entry.flags() | Qt.ItemIsUserCheckable)
-            entry.setCheckState(0, Qt.Checked)
-            entry.setData(Qt.UserRole, animation.package_path)
-            self.animation_list.addItem(entry)
+        if group.is_static:
+            # The same list widget doubles as the static-mesh checklist; the
+            # selection UX is identical, only the payload differs.
+            for mesh in group.meshes:
+                entry = QListWidgetItem(mesh.name)
+                entry.setFlags(entry.flags() | Qt.ItemIsUserCheckable)
+                entry.setCheckState(0, Qt.Checked)
+                entry.setData(Qt.UserRole, mesh.package_path)
+                if mesh.textures:
+                    entry.setToolTip(f"引用 {len(mesh.textures)} 个贴图")
+                self.animation_list.addItem(entry)
+        else:
+            for animation in group.animations:
+                label = animation.name
+                if animation.duration:
+                    label += f"   {animation.duration:.2f}s"
+                if animation.num_frames:
+                    label += f" / {animation.num_frames} 帧"
+                if infer_loop(animation.name):
+                    label += "   [循环]"
+                entry = QListWidgetItem(label)
+                entry.setFlags(entry.flags() | Qt.ItemIsUserCheckable)
+                entry.setCheckState(0, Qt.Checked)
+                entry.setData(Qt.UserRole, animation.package_path)
+                self.animation_list.addItem(entry)
         self.animation_list.blockSignals(False)
         self._apply_filter()
         self._update_summary()
@@ -591,6 +634,17 @@ class SelectPage(WizardPage):
     def _select_looping(self) -> None:
         from ..unity.manifest import infer_loop
 
+        scan = self.window.scan
+        current = self.group_list.currentItem()
+        index = current.data(0, Qt.UserRole) if current is not None else None
+        if (
+            scan is not None
+            and index is not None
+            and 0 <= index < len(scan.groups)
+            and scan.groups[index].is_static
+        ):
+            return
+
         self.animation_list.blockSignals(True)
         for row in range(self.animation_list.count()):
             item = self.animation_list.item(row)
@@ -603,16 +657,60 @@ class SelectPage(WizardPage):
     # ------------------------------------------------------------------ state
 
     def _update_summary(self) -> None:
-        groups = self._checked_groups()
-        animations = sum(
+        scan = self.window.scan
+        checked = self._checked_groups()
+        selected = 0
+        if scan is not None:
+            for index in checked:
+                if 0 <= index < len(scan.groups) and scan.groups[index].is_static:
+                    selected += self._checked_mesh_count(index)
+        current = self.group_list.currentItem()
+        current_index = current.data(0, Qt.UserRole) if current is not None else None
+        current_static = (
+            scan is not None
+            and current_index is not None
+            and 0 <= current_index < len(scan.groups)
+            and scan.groups[current_index].is_static
+        )
+
+        if current_static:
+            count = sum(
+                1
+                for row in range(self.animation_list.count())
+                if self.animation_list.item(row).checkState(0) == Qt.Checked
+            )
+            detail = f"当前组勾选 {count} 个网格。"
+        else:
+            animations = sum(
+                1
+                for row in range(self.animation_list.count())
+                if self.animation_list.item(row).checkState(0) == Qt.Checked
+            )
+            detail = f"当前组勾选 {animations} 个动画。"
+
+        self.summary.setText(
+            f"已选择 {len(checked)} 个转换组（静态网格 {selected} 个）；{detail}"
+        )
+        self.window.refresh_navigation()
+
+    def _checked_mesh_count(self, index: int) -> int:
+        """Checked meshes for a static group, mirroring ``build_selection``.
+
+        Groups other than the one on screen keep their full mesh list, so the
+        count is only read from the list when it is actually showing them.
+        """
+        scan = self.window.scan
+        if scan is None or not (0 <= index < len(scan.groups)):
+            return 0
+        group = scan.groups[index]
+        current = self.group_list.currentItem()
+        if current is None or current.data(0, Qt.UserRole) != index:
+            return len(group.meshes)
+        return sum(
             1
             for row in range(self.animation_list.count())
             if self.animation_list.item(row).checkState(0) == Qt.Checked
         )
-        self.summary.setText(
-            f"已选择 {len(groups)} 个骨架组；当前组勾选 {animations} 个动画。"
-        )
-        self.window.refresh_navigation()
 
     def build_selection(self) -> list[SelectedGroup]:
         """Materialise the current UI state into pipeline objects."""
@@ -622,15 +720,28 @@ class SelectPage(WizardPage):
 
         checked = set(self._checked_groups())
         selection: list[SelectedGroup] = []
+        current = self.group_list.currentItem()
+        current_index = current.data(0, Qt.UserRole) if current is not None else None
 
         for index, group in enumerate(scan.groups):
             if index not in checked:
                 continue
 
+            if group.is_static:
+                meshes = list(group.meshes)
+                if current_index == index:
+                    packages = {
+                        self.animation_list.item(row).data(Qt.UserRole)
+                        for row in range(self.animation_list.count())
+                        if self.animation_list.item(row).checkState(0) == Qt.Checked
+                    }
+                    meshes = [m for m in group.meshes if m.package_path in packages]
+                selection.append(SelectedGroup(group=group, meshes=meshes))
+                continue
+
             # Animations checked in the currently displayed group.
             chosen_animations = list(group.animations)
-            current = self.group_list.currentItem()
-            if current is not None and current.data(0, Qt.UserRole) == index:
+            if current_index == index:
                 packages = {
                     self.animation_list.item(row).data(Qt.UserRole)
                     for row in range(self.animation_list.count())
@@ -641,7 +752,7 @@ class SelectPage(WizardPage):
                 ]
 
             mesh = group.reference_mesh
-            if current is not None and current.data(0, Qt.UserRole) == index:
+            if current_index == index:
                 package = self.mesh_combo.currentData()
                 if package:
                     mesh = next(
@@ -710,6 +821,14 @@ class SettingsPage(WizardPage):
         self.materials_check.setChecked(True)
         form.addRow("", self.materials_check)
 
+        self.textures_check = QCheckBox("导出静态网格使用的贴图，并生成 Unity 材质")
+        self.textures_check.setChecked(True)
+        self.textures_check.setToolTip(
+            "Unreal 的 FBX 导出器无法把贴图写进 FBX（引擎源码写死 bEmbedMedia=false），"
+            "所以贴图会单独导出为 PNG，并由 UnrealResourceImporter.cs 自动装配到材质上。"
+        )
+        form.addRow("", self.textures_check)
+
         self.body.addWidget(box)
 
         self.preview = QPlainTextEdit()
@@ -740,6 +859,7 @@ class SettingsPage(WizardPage):
             root_motion=RootMotionMode(self.root_combo.currentData()),
             scale=float(self.scale_spin.value()),
             export_materials=self.materials_check.isChecked(),
+            export_textures=self.textures_check.isChecked(),
         )
 
     def _refresh_preview(self) -> None:
@@ -751,21 +871,47 @@ class SettingsPage(WizardPage):
             lines.append("  （先完成扫描）")
         else:
             checked = set(self.window.checked_group_indices())
-            lines.append("  Characters/")
-            for index, group in enumerate(scan.groups):
-                if index not in checked:
-                    continue
-                name = group_output_name(group)
-                lines.append(f"    {name}/")
-                lines.append("      Mesh/")
-                if group.reference_mesh:
-                    lines.append(f"        {group.reference_mesh.name}.fbx")
-                lines.append("      Animations/")
-                for animation in group.animations[:4]:
-                    lines.append(f"        {animation.name}.fbx")
-                if len(group.animations) > 4:
-                    lines.append(f"        … 共 {len(group.animations)} 个")
-                lines.append("      profile.json")
+            characters = [
+                (i, g)
+                for i, g in enumerate(scan.groups)
+                if i in checked and not g.is_static
+            ]
+            statics = [
+                (i, g)
+                for i, g in enumerate(scan.groups)
+                if i in checked and g.is_static
+            ]
+            if characters:
+                lines.append("  Characters/")
+                for _index, group in characters:
+                    name = group_output_name(group)
+                    lines.append(f"    {name}/")
+                    lines.append("      Mesh/")
+                    if group.reference_mesh:
+                        lines.append(f"        {group.reference_mesh.name}.fbx")
+                    lines.append("      Animations/")
+                    for animation in group.animations[:4]:
+                        lines.append(f"        {animation.name}.fbx")
+                    if len(group.animations) > 4:
+                        lines.append(f"        … 共 {len(group.animations)} 个")
+                    lines.append("      profile.json")
+            if statics:
+                lines.append("  StaticMeshes/")
+                shown = 0
+                for _index, group in statics:
+                    folder = group.relative_dir or "."
+                    lines.append(f"    {folder}/")
+                    for mesh in group.meshes[:3]:
+                        lines.append(f"      {mesh.name}.fbx")
+                    if len(group.meshes) > 3:
+                        lines.append(f"      … 共 {len(group.meshes)} 个")
+                    shown += len(group.meshes)
+                lines.append("    Materials/")
+                lines.append("      <Unreal 材质名>.mat")
+                if self.textures_check.isChecked():
+                    lines.append("    _Textures/")
+                    lines.append("      <贴图包路径>/<贴图名>.png")
+                lines.append(f"    （共 {shown} 个网格）")
         lines.append("  Editor/")
         lines.append("    UnrealResourceImporter.cs")
         lines.append("    UnrealImportTests.cs")
@@ -841,12 +987,17 @@ class RunPage(WizardPage):
         self.start_button.setEnabled(True)
         self.open_button.setEnabled(True)
         self.summary_label.setText(
-            f"计划：{len(plan.groups)} 个骨架组，"
+            f"计划：{len(plan.skeletal_groups)} 个骨骼组，"
+            f"{len(plan.static_groups)} 个静态组，"
             f"{sum(len(g.mesh_requests) for g in plan.groups)} 个网格，"
-            f"{sum(len(g.animation_requests) for g in plan.groups)} 个动画。"
+            f"{sum(len(g.animation_requests) for g in plan.groups)} 个动画，"
+            f"{len(plan.texture_requests)} 个贴图。"
         )
         for request in plan.all_requests:
             self._append_row(request.kind.label, request.display_name, "")
+        if plan.texture_requests and plan.settings.export_textures:
+            for request in plan.texture_requests:
+                self._append_row("贴图", request.display_name, request.output_rel)
 
     def _append_row(self, kind: str, name: str, detail: str) -> int:
         row = self.table.rowCount()

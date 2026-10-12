@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .models import ExportOutcome, ExportSettings, ItemStatus
+from .models import AssetKind, ExportOutcome, ExportSettings, ItemStatus
 
 
 @dataclass
@@ -45,6 +45,15 @@ class ExportReport:
         return [o for o in self.failed if o.retryable]
 
     @property
+    def fbx_outcomes(self) -> list[ExportOutcome]:
+        """Everything except textures; textures ride along in the same report."""
+        return [o for o in self.outcomes if o.request.kind is not AssetKind.TEXTURE]
+
+    @property
+    def texture_outcomes(self) -> list[ExportOutcome]:
+        return [o for o in self.outcomes if o.request.kind is AssetKind.TEXTURE]
+
+    @property
     def success_count(self) -> int:
         return len(self.succeeded)
 
@@ -64,6 +73,14 @@ class ExportReport:
                 "succeeded": self.success_count,
                 "failed": self.failure_count,
                 "retryable": len(self.retryable),
+                "fbx_total": len(self.fbx_outcomes),
+                "fbx_succeeded": sum(
+                    1 for o in self.fbx_outcomes if o.status is ItemStatus.OK
+                ),
+                "texture_total": len(self.texture_outcomes),
+                "texture_succeeded": sum(
+                    1 for o in self.texture_outcomes if o.status is ItemStatus.OK
+                ),
             },
             "source": {
                 "content_root": self.source_content_root,
@@ -87,10 +104,24 @@ class ExportReport:
         return target
 
     def summary_line(self) -> str:
-        return (
-            f"共 {len(self.outcomes)} 项：成功 {self.success_count}，"
-            f"失败 {self.failure_count}（可重试 {len(self.retryable)}）"
-        )
+        parts = []
+        fbx = self.fbx_outcomes
+        if fbx:
+            parts.append(
+                f"FBX 成功 {sum(1 for o in fbx if o.status is ItemStatus.OK)}/{len(fbx)}"
+            )
+        textures = self.texture_outcomes
+        if textures:
+            parts.append(
+                "贴图成功 "
+                f"{sum(1 for o in textures if o.status is ItemStatus.OK)}/{len(textures)}"
+            )
+        if not parts:
+            return "没有任何导出项。"
+        detail = "，".join(parts)
+        if self.failure_count:
+            detail += f"；失败 {self.failure_count}（可重试 {len(self.retryable)}）"
+        return detail
 
     @staticmethod
     def timestamp() -> str:

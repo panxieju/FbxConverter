@@ -16,6 +16,7 @@ using System.Linq;
 using System.Text;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace FbxConverter.Editor
 {
@@ -60,6 +61,51 @@ namespace FbxConverter.Editor
     }
 
     [Serializable]
+    public class ManifestTexture
+    {
+        public string name;
+        public string path;
+        public string unrealPackage;
+        public string textureType;
+        public string unrealClass;
+        public bool srgb;
+        public int bytes;
+        public int width;
+        public int height;
+    }
+
+    [Serializable]
+    public class ManifestMaterial
+    {
+        public string name;
+        public string unrealMaterial;
+        public string baseColor;
+        public string normal;
+        public string mask;
+        public string[] allTextures;
+    }
+
+    [Serializable]
+    public class ManifestSlot
+    {
+        public string slotName;
+        public int materialIndex;
+    }
+
+    [Serializable]
+    public class ManifestStaticMesh
+    {
+        public string name;
+        public string fbx;
+        public string unrealPackage;
+        public string group;
+        public string relativeDir;
+        public int triangleHint;
+        public int slotCount;
+        public ManifestSlot[] slots;
+    }
+
+    [Serializable]
     public class Manifest
     {
         public int schemaVersion;
@@ -73,6 +119,12 @@ namespace FbxConverter.Editor
         public int characterCount;
         public int animationCount;
         public ManifestCharacter[] characters;
+        public ManifestTexture[] textures;
+        public ManifestMaterial[] materials;
+        public ManifestStaticMesh[] staticMeshes;
+        public int staticMeshCount;
+        public int textureCount;
+        public int materialCount;
     }
 
     // -----------------------------------------------------------------------
@@ -158,6 +210,36 @@ namespace FbxConverter.Editor
         public int totalCurveBindings;
         public readonly List<string> sampleCurves = new List<string>();
         public readonly List<string> rootMotionPaths = new List<string>();
+        public readonly List<string> problems = new List<string>();
+        public readonly List<string> notices = new List<string>();
+    }
+
+    public class TextureEntry
+    {
+        public string package;
+        public string assetPath;
+        public string textureType;
+        public bool srgb;
+        public int bytes;
+        public string status = "ok";
+        public readonly List<string> problems = new List<string>();
+    }
+
+    public class StaticMeshEntry
+    {
+        public string name;
+        public string group;
+        public string fbx;
+        public string meshAsset;
+        public int slotCount;
+        public int rendererCount;
+        public int triangleCount;
+        public float heightMetres;
+        public float widthMetres;
+        public float depthMetres;
+        public string dominantAxis;
+        public string status = "ok";
+        public readonly List<string> materialNames = new List<string>();
         public readonly List<string> problems = new List<string>();
         public readonly List<string> notices = new List<string>();
     }
@@ -278,30 +360,49 @@ namespace FbxConverter.Editor
             }
 
             Manifest manifest = JsonUtility.FromJson<Manifest>(File.ReadAllText(manifestPath, Encoding.UTF8));
-            if (manifest == null || manifest.characters == null || manifest.characters.Length == 0)
+            bool hasCharacters = manifest != null
+                                 && manifest.characters != null
+                                 && manifest.characters.Length > 0;
+            bool hasStatics = manifest != null
+                              && manifest.staticMeshes != null
+                              && manifest.staticMeshes.Length > 0;
+            if (!hasCharacters && !hasStatics)
             {
-                Fail("manifest.json 中没有角色条目。");
+                Fail("manifest.json 中没有角色或静态网格条目。");
                 return;
             }
 
             Debug.Log(string.Format(
                 CultureInfo.InvariantCulture,
-                "[FbxConverter] 导入 {0} 个角色 / {1} 个动画（引擎 {2}）",
+                "[FbxConverter] 导入 {0} 个角色 / {1} 个动画 / {2} 个静态网格 / {3} 个贴图（引擎 {4}）",
                 manifest.characterCount,
                 manifest.animationCount,
+                manifest.staticMeshCount,
+                manifest.textureCount,
                 manifest.source != null ? manifest.source.engineVersion : "?"));
 
             List<ValidationEntry> results = new List<ValidationEntry>();
-            foreach (ManifestCharacter character in manifest.characters)
+            if (hasCharacters)
             {
-                results.Add(ImportCharacter(exportRoot, character, manifest));
+                foreach (ManifestCharacter character in manifest.characters)
+                {
+                    results.Add(ImportCharacter(exportRoot, character, manifest));
+                }
+            }
+
+            List<TextureEntry> textureResults = new List<TextureEntry>();
+            List<StaticMeshEntry> staticResults = new List<StaticMeshEntry>();
+            if (hasStatics)
+            {
+                ImportStatics(exportRoot, manifest, textureResults, staticResults);
             }
 
             AssetDatabase.SaveAssets();
             AssetDatabase.Refresh();
 
-            string reportPath = WriteReport(exportRoot, manifest, results);
-            ReportSummary(results, reportPath);
+            string reportPath = WriteReport(
+                exportRoot, manifest, results, textureResults, staticResults);
+            ReportSummary(results, textureResults, staticResults, reportPath);
         }
 
         private static ValidationEntry ImportCharacter(
@@ -473,6 +574,455 @@ namespace FbxConverter.Editor
         {
             return !string.IsNullOrEmpty(profile.importType) &&
                    profile.importType.Equals("Humanoid", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // -------------------------------------------------------------------
+        // Static meshes, materials and textures
+        //
+        // Unreal's FBX exporter cannot embed textures (FbxMainExport.cpp
+        // hard-codes bEmbedMedia = false, and UFbxExportOption has no switch
+        // for it), and what it writes instead is the *original authoring path*
+        // from the texture's import data. So the PNGs are exported separately
+        // and stitched back together here, from manifest.json.
+        // -------------------------------------------------------------------
+
+        private static void ImportStatics(
+            string exportRoot,
+            Manifest manifest,
+            List<TextureEntry> textureResults,
+            List<StaticMeshEntry> staticResults)
+        {
+            // --- 1. textures -------------------------------------------------
+            Dictionary<string, Texture2D> loaded = new Dictionary<string, Texture2D>();
+            if (manifest.textures != null)
+            {
+                foreach (ManifestTexture texture in manifest.textures)
+                {
+                    TextureEntry entry = ImportTexture(exportRoot, texture, loaded);
+                    textureResults.Add(entry);
+                }
+            }
+            // --- 2. one shared Material asset per Unreal material -------------
+            // Created *before* the models are imported so the importer's
+            // SearchAndRemapMaterials can find them by name and wire the model
+            // prefab straight at them.
+            Dictionary<int, Material> materials = new Dictionary<int, Material>();
+            Dictionary<string, string> claimed = new Dictionary<string, string>();
+            List<string> materialProblems = new List<string>();
+            if (manifest.materials != null)
+            {
+                for (int index = 0; index < manifest.materials.Length; index++)
+                {
+                    Material material = BuildMaterial(
+                        exportRoot, manifest.materials[index], loaded,
+                        claimed, materialProblems);
+                    if (material != null)
+                    {
+                        materials[index] = material;
+                    }
+                }
+            }
+
+            AssetDatabase.SaveAssets();
+
+            // --- 3. the meshes themselves ------------------------------------
+            if (manifest.staticMeshes == null)
+            {
+                return;
+            }
+            foreach (ManifestStaticMesh mesh in manifest.staticMeshes)
+            {
+                StaticMeshEntry entry = ImportStaticMesh(exportRoot, mesh, manifest, materials);
+                // A name clash affects every mesh that uses the losing material.
+                if (materialProblems.Count > 0 && mesh.slots != null)
+                {
+                    foreach (string problem in materialProblems)
+                    {
+                        if (!entry.problems.Contains(problem))
+                        {
+                            entry.problems.Add(problem);
+                        }
+                    }
+                    if (entry.status == "ok")
+                    {
+                        entry.status = "warnings";
+                    }
+                }
+                staticResults.Add(entry);
+            }
+        }
+
+        private static TextureEntry ImportTexture(
+            string exportRoot, ManifestTexture texture, Dictionary<string, Texture2D> loaded)
+        {
+            TextureEntry entry = new TextureEntry
+            {
+                package = texture.unrealPackage,
+                textureType = texture.textureType,
+                srgb = texture.srgb,
+                bytes = texture.bytes,
+            };
+
+            string assetPath = ToAssetPath(exportRoot, texture.path);
+            entry.assetPath = assetPath;
+            if (string.IsNullOrEmpty(assetPath))
+            {
+                entry.status = "failed";
+                entry.problems.Add("贴图不在 Assets 下或文件缺失: " + texture.path);
+                return entry;
+            }
+
+            TextureImporter importer = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+            if (importer == null)
+            {
+                entry.status = "failed";
+                entry.problems.Add("无法获取 TextureImporter: " + assetPath);
+                return entry;
+            }
+
+            bool isNormal = string.Equals(texture.textureType, "normal", StringComparison.OrdinalIgnoreCase);
+            try
+            {
+                importer.textureType = isNormal ? TextureImporterType.NormalMap : TextureImporterType.Default;
+                importer.sRGBTexture = isNormal ? false : texture.srgb;
+                importer.mipmapEnabled = true;
+                importer.wrapMode = TextureWrapMode.Repeat;
+                importer.filterMode = FilterMode.Bilinear;
+            }
+            catch (Exception exception)
+            {
+                entry.status = "failed";
+                entry.problems.Add("设置贴图导入参数失败: " + exception.Message);
+                return entry;
+            }
+
+            AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceUpdate);
+
+            Texture2D asset = AssetDatabase.LoadAssetAtPath<Texture2D>(assetPath);
+            if (asset == null)
+            {
+                entry.status = "failed";
+                entry.problems.Add("导入后无法加载贴图: " + assetPath);
+                return entry;
+            }
+            loaded[texture.name] = asset;
+            if (asset.width <= 1 && asset.height <= 1)
+            {
+                entry.problems.Add("贴图尺寸异常（" + asset.width + "x" + asset.height + "）。");
+            }
+            else if (texture.width > 0 && asset.width < texture.width)
+            {
+                // Unity's default maxTextureSize is 2048; silent downscaling is
+                // the usual reason an imported model looks softer than Unreal.
+                entry.problems.Add("贴图被降采样：" + texture.width + "x" + texture.height +
+                    " -> " + asset.width + "x" + asset.height +
+                    "（TextureImporter.maxTextureSize 上限）。需要原始尺寸请调高该值后重新导入。");
+            }
+            if (entry.problems.Count > 0)
+            {
+                entry.status = "warnings";
+            }
+            return entry;
+        }
+
+        private static Shader ResolveLitShader()
+        {
+            // The project's own pipeline decides which Lit shader exists; asking
+            // for the other one silently yields null and leaves materials with
+            // the FBX-imported shader.
+            bool scriptable = GraphicsSettings.currentRenderPipeline != null ||
+                              GraphicsSettings.defaultRenderPipeline != null;
+            if (scriptable)
+            {
+                Shader urp = Shader.Find("Universal Render Pipeline/Lit");
+                if (urp != null)
+                {
+                    return urp;
+                }
+                Shader hdrp = Shader.Find("HDRP/Lit");
+                if (hdrp != null)
+                {
+                    return hdrp;
+                }
+            }
+            return Shader.Find("Standard");
+        }
+
+        private static void SetFirstProperty(Material material, string[] names, Texture texture)
+        {
+            if (material == null || texture == null)
+            {
+                return;
+            }
+            foreach (string name in names)
+            {
+                if (material.HasProperty(name))
+                {
+                    material.SetTexture(name, texture);
+                    return;
+                }
+            }
+        }
+
+        private static Material BuildMaterial(
+            string exportRoot,
+            ManifestMaterial definition,
+            Dictionary<string, Texture2D> loaded,
+            Dictionary<string, string> claimed,
+            List<string> problems)
+        {
+            if (definition == null || string.IsNullOrEmpty(definition.name))
+            {
+                return null;
+            }
+
+            string materialDirectory = Path.Combine(exportRoot, "StaticMeshes", "Materials");
+            Directory.CreateDirectory(materialDirectory);
+
+            // Material assets live in one folder next to the meshes, so the
+            // FBX importer's RecursiveUp search finds exactly one candidate per
+            // Unreal material instead of a per-FBX duplicate.
+            //
+            // The asset name has to stay equal to the Unreal material name,
+            // because that is what Unity matches on. Two different Unreal
+            // materials sharing a name therefore cannot both bind; keep them as
+            // separate assets so one is not silently overwritten, and report it.
+            string assetName = definition.name;
+            if (claimed.TryGetValue(assetName, out string owner) &&
+                !string.Equals(owner, definition.unrealMaterial, StringComparison.Ordinal))
+            {
+                int suffix = 2;
+                string alternative;
+                do
+                {
+                    alternative = assetName + "__" + suffix;
+                    suffix++;
+                }
+                while (claimed.ContainsKey(alternative));
+                problems.Add("材质同名冲突：" + owner + " 与 " + definition.unrealMaterial +
+                    " 都叫 " + assetName + "；后者存为 " + alternative +
+                    ".mat，但 Unity 按名绑定只能命中前者。");
+                claimed[alternative] = definition.unrealMaterial;
+                assetName = alternative;
+            }
+            else
+            {
+                claimed[assetName] = definition.unrealMaterial;
+            }
+
+            string relative = "StaticMeshes/Materials/" + assetName + ".mat";
+            string assetPath = ToAssetPath(exportRoot, relative);
+            if (string.IsNullOrEmpty(assetPath))
+            {
+                return null;
+            }
+
+            Material material = AssetDatabase.LoadAssetAtPath<Material>(assetPath);
+            if (material == null)
+            {
+                Shader shader = ResolveLitShader();
+                material = shader != null ? new Material(shader) : new Material(Shader.Find("Standard"));
+                material.name = assetName;
+                AssetDatabase.CreateAsset(material, assetPath);
+            }
+            else
+            {
+                Shader shader = ResolveLitShader();
+                if (shader != null && material.shader != shader)
+                {
+                    material.shader = shader;
+                }
+            }
+
+            AssignTexture(material, definition.baseColor, loaded,
+                new[] { "_BaseMap", "_MainTex" }, new[] { "_BaseColor", "_Color" });
+            AssignTexture(material, definition.normal, loaded,
+                new[] { "_BumpMap", "_NormalMap" }, null);
+            AssignTexture(material, definition.mask, loaded,
+                new[] { "_MetallicGlossMap", "_OcclusionMap" }, null);
+
+            // An Unreal material with no texture parameters is a flat colour;
+            // there is nothing to reconstruct, so use a neutral tint rather
+            // than leaving the default magenta-ish placeholder.
+            if (string.IsNullOrEmpty(definition.baseColor) &&
+                string.IsNullOrEmpty(definition.normal) &&
+                string.IsNullOrEmpty(definition.mask))
+            {
+                Color neutral = new Color(0.75f, 0.75f, 0.75f, 1f);
+                if (material.HasProperty("_BaseColor"))
+                {
+                    material.SetColor("_BaseColor", neutral);
+                }
+                if (material.HasProperty("_Color"))
+                {
+                    material.SetColor("_Color", neutral);
+                }
+            }
+
+            EditorUtility.SetDirty(material);
+            return material;
+        }
+
+        private static void AssignTexture(
+            Material material,
+            string textureName,
+            Dictionary<string, Texture2D> loaded,
+            string[] textureProperties,
+            string[] tintProperties)
+        {
+            if (string.IsNullOrEmpty(textureName) || !loaded.ContainsKey(textureName))
+            {
+                return;
+            }
+            SetFirstProperty(material, textureProperties, loaded[textureName]);
+            if (tintProperties != null)
+            {
+                foreach (string name in tintProperties)
+                {
+                    if (material.HasProperty(name))
+                    {
+                        material.SetColor(name, Color.white);
+                        break;
+                    }
+                }
+            }
+        }
+
+        private static StaticMeshEntry ImportStaticMesh(
+            string exportRoot,
+            ManifestStaticMesh mesh,
+            Manifest manifest,
+            Dictionary<int, Material> materials)
+        {
+            StaticMeshEntry entry = new StaticMeshEntry
+            {
+                name = mesh.name,
+                group = mesh.group,
+                fbx = mesh.fbx,
+                slotCount = mesh.slotCount,
+            };
+
+            string assetPath = ToAssetPath(exportRoot, mesh.fbx);
+            entry.meshAsset = assetPath;
+            if (string.IsNullOrEmpty(assetPath))
+            {
+                entry.status = "failed";
+                entry.problems.Add("网格 FBX 缺失或不在 Assets 下: " + mesh.fbx);
+                return entry;
+            }
+
+            ModelImporter importer = AssetImporter.GetAtPath(assetPath) as ModelImporter;
+            if (importer == null)
+            {
+                entry.status = "failed";
+                entry.problems.Add("无法获取 ModelImporter: " + assetPath);
+                return entry;
+            }
+
+            // Import the FBX materials (Unreal wrote the material *names* into
+            // it) and let Unity attach the Material assets we just created,
+            // instead of leaving per-FBX duplicates behind.
+            importer.materialImportMode = ModelImporterMaterialImportMode.ImportStandard;
+            importer.materialName = ModelImporterMaterialName.BasedOnMaterialName;
+            importer.materialSearch = ModelImporterMaterialSearch.RecursiveUp;
+            importer.globalScale = manifest.settings != null ? manifest.settings.scale : 1f;
+            importer.importAnimation = false;
+            importer.importBlendShapes = false;
+            importer.importCameras = false;
+            importer.importLights = false;
+            importer.isReadable = false;
+            importer.SaveAndReimport();
+
+            importer.SearchAndRemapMaterials(
+                ModelImporterMaterialName.BasedOnMaterialName,
+                ModelImporterMaterialSearch.RecursiveUp);
+
+            AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceUpdate);
+
+            GameObject prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+            if (prefab == null)
+            {
+                entry.status = "failed";
+                entry.problems.Add("导入后无法加载模型: " + assetPath);
+                return entry;
+            }
+
+            Renderer[] renderers = prefab.GetComponentsInChildren<Renderer>(true);
+            entry.rendererCount = renderers.Length;
+            foreach (Renderer renderer in renderers)
+            {
+                foreach (Material material in renderer.sharedMaterials)
+                {
+                    string name = material == null ? "(null)" : material.name;
+                    if (!entry.materialNames.Contains(name))
+                    {
+                        entry.materialNames.Add(name);
+                    }
+                }
+                MeshFilter filter = renderer.GetComponent<MeshFilter>();
+                if (filter != null && filter.sharedMesh != null)
+                {
+                    entry.triangleCount += filter.sharedMesh.triangles.Length / 3;
+                }
+            }
+
+            // Did the remap actually take? A material still named after Unity's
+            // default means the FBX carried no usable material node for that
+            // slot, which is a real (reportable) limitation, not a success.
+            for (int index = 0; index < entry.materialNames.Count; index++)
+            {
+                string name = entry.materialNames[index];
+                if (name == "Default-Material" || name == "Default-Material (Instance)" ||
+                    name == "WorldGridMaterial" || name == "(null)")
+                {
+                    entry.problems.Add("材质槽 " + index + " 仍在使用 Unity 默认材质（" + name +
+                        "）：该网格的材质没有随 FBX 导出。");
+                }
+            }
+
+            if (materials.Count > 0 && mesh.slots != null)
+            {
+                foreach (ManifestSlot slot in mesh.slots)
+                {
+                    if (!materials.ContainsKey(slot.materialIndex))
+                    {
+                        entry.problems.Add("材质表缺少索引 " + slot.materialIndex +
+                            "（槽 " + slot.slotName + "）。");
+                    }
+                }
+            }
+
+            MeasureMesh(assetPath, entry);
+            if (entry.problems.Count > 0 && entry.status == "ok")
+            {
+                entry.status = "warnings";
+            }
+            return entry;
+        }
+
+        private static void MeasureMesh(string assetPath, StaticMeshEntry entry)
+        {
+            GameObject prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+            if (prefab == null)
+            {
+                return;
+            }
+            Renderer[] renderers = prefab.GetComponentsInChildren<Renderer>(true);
+            if (renderers.Length == 0)
+            {
+                return;
+            }
+            Bounds bounds = renderers[0].bounds;
+            for (int index = 1; index < renderers.Length; index++)
+            {
+                bounds.Encapsulate(renderers[index].bounds);
+            }
+            // UE exports centimetres and Unity's file scale turns them into
+            // metres, so the imported bounds are directly comparable.
+            entry.widthMetres = bounds.size.x;
+            entry.heightMetres = bounds.size.y;
+            entry.depthMetres = bounds.size.z;
+            entry.dominantAxis = DominantAxis(bounds.size);
         }
 
         // -------------------------------------------------------------------
@@ -909,11 +1459,15 @@ namespace FbxConverter.Editor
         // -------------------------------------------------------------------
 
         private static string WriteReport(
-            string exportRoot, Manifest manifest, List<ValidationEntry> entries)
+            string exportRoot,
+            Manifest manifest,
+            List<ValidationEntry> entries,
+            List<TextureEntry> textures,
+            List<StaticMeshEntry> statics)
         {
             StringBuilder builder = new StringBuilder();
             builder.Append("{\n");
-            builder.Append("  \"schemaVersion\": 1,\n");
+            builder.Append("  \"schemaVersion\": 2,\n");
             builder.Append("  \"generatedAt\": \"").Append(Escape(DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss"))).Append("\",\n");
             builder.Append("  \"unityVersion\": \"").Append(Escape(Application.unityVersion)).Append("\",\n");
             builder.Append("  \"manifest\": \"manifest.json\",\n");
@@ -928,7 +1482,12 @@ namespace FbxConverter.Editor
             builder.Append("    \"characters\": ").Append(entries.Count).Append(",\n");
             builder.Append("    \"ok\": ").Append(entries.Count(e => e.status == "ok")).Append(",\n");
             builder.Append("    \"warnings\": ").Append(warnings).Append(",\n");
-            builder.Append("    \"failed\": ").Append(failed).Append("\n");
+            builder.Append("    \"failed\": ").Append(failed).Append(",\n");
+            builder.Append("    \"textures\": ").Append(textures.Count).Append(",\n");
+            builder.Append("    \"texturesOk\": ").Append(textures.Count(t => t.status == "ok")).Append(",\n");
+            builder.Append("    \"staticMeshes\": ").Append(statics.Count).Append(",\n");
+            builder.Append("    \"staticMeshesOk\": ").Append(statics.Count(s => s.status == "ok")).Append(",\n");
+            builder.Append("    \"materials\": ").Append(manifest.materials != null ? manifest.materials.Length : 0).Append("\n");
             builder.Append("  },\n");
 
             builder.Append("  \"characters\": [\n");
@@ -983,6 +1542,49 @@ namespace FbxConverter.Editor
                 builder.Append("]\n");
                 builder.Append(i == entries.Count - 1 ? "    }\n" : "    },\n");
             }
+            builder.Append("  ],\n");
+
+            builder.Append("  \"textures\": [\n");
+            for (int i = 0; i < textures.Count; i++)
+            {
+                TextureEntry texture = textures[i];
+                builder.Append("    {\n");
+                builder.Append("      \"unrealPackage\": \"").Append(Escape(texture.package)).Append("\",\n");
+                builder.Append("      \"assetPath\": \"").Append(Escape(texture.assetPath)).Append("\",\n");
+                builder.Append("      \"textureType\": \"").Append(Escape(texture.textureType)).Append("\",\n");
+                builder.Append("      \"srgb\": ").Append(Bool(texture.srgb)).Append(",\n");
+                builder.Append("      \"bytes\": ").Append(texture.bytes).Append(",\n");
+                builder.Append("      \"status\": \"").Append(Escape(texture.status)).Append("\",\n");
+                // Must stay the last field of the object: the helper's
+                // trailingComma argument is the only thing keeping the report
+                // valid JSON.
+                AppendStringArray(builder, "problems", texture.problems, false);
+                builder.Append(i == textures.Count - 1 ? "    }\n" : "    },\n");
+            }
+            builder.Append("  ],\n");
+
+            builder.Append("  \"staticMeshes\": [\n");
+            for (int i = 0; i < statics.Count; i++)
+            {
+                StaticMeshEntry mesh = statics[i];
+                builder.Append("    {\n");
+                builder.Append("      \"name\": \"").Append(Escape(mesh.name)).Append("\",\n");
+                builder.Append("      \"group\": \"").Append(Escape(mesh.group)).Append("\",\n");
+                builder.Append("      \"fbx\": \"").Append(Escape(mesh.fbx)).Append("\",\n");
+                builder.Append("      \"meshAsset\": \"").Append(Escape(mesh.meshAsset)).Append("\",\n");
+                builder.Append("      \"status\": \"").Append(Escape(mesh.status)).Append("\",\n");
+                builder.Append("      \"slotCount\": ").Append(mesh.slotCount).Append(",\n");
+                builder.Append("      \"rendererCount\": ").Append(mesh.rendererCount).Append(",\n");
+                builder.Append("      \"triangleCount\": ").Append(mesh.triangleCount).Append(",\n");
+                builder.Append("      \"widthMetres\": ").Append(Float(mesh.widthMetres)).Append(",\n");
+                builder.Append("      \"heightMetres\": ").Append(Float(mesh.heightMetres)).Append(",\n");
+                builder.Append("      \"depthMetres\": ").Append(Float(mesh.depthMetres)).Append(",\n");
+                builder.Append("      \"dominantAxis\": \"").Append(Escape(mesh.dominantAxis)).Append("\",\n");
+                AppendStringArray(builder, "materialNames", mesh.materialNames, true);
+                AppendStringArray(builder, "problems", mesh.problems, true);
+                AppendStringArray(builder, "notices", mesh.notices, false);
+                builder.Append(i == statics.Count - 1 ? "    }\n" : "    },\n");
+            }
             builder.Append("  ]\n");
             builder.Append("}\n");
 
@@ -993,7 +1595,32 @@ namespace FbxConverter.Editor
             return reportPath;
         }
 
-        private static void ReportSummary(List<ValidationEntry> entries, string reportPath)
+        /// <summary>
+        /// Append a JSON string array. <paramref name="trailingComma"/> must be
+        /// false for the last field of the enclosing object -- JSON has no
+        /// trailing commas, and a single wrong flag makes the whole report
+        /// unparsable.
+        /// </summary>
+        private static void AppendStringArray(
+            StringBuilder builder, string name, List<string> values, bool trailingComma)
+        {
+            builder.Append("      \"").Append(name).Append("\": [");
+            for (int i = 0; i < values.Count; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(", ");
+                }
+                builder.Append('"').Append(Escape(values[i])).Append('"');
+            }
+            builder.Append("]").Append(trailingComma ? ",\n" : "\n");
+        }
+
+        private static void ReportSummary(
+            List<ValidationEntry> entries,
+            List<TextureEntry> textures,
+            List<StaticMeshEntry> statics,
+            string reportPath)
         {
             foreach (ValidationEntry entry in entries)
             {
@@ -1014,12 +1641,47 @@ namespace FbxConverter.Editor
                 }
             }
 
-            int problems = entries.Sum(e => e.problems.Count);
-            int notices = entries.Sum(e => e.notices.Count);
+            foreach (TextureEntry texture in textures)
+            {
+                foreach (string problem in texture.problems)
+                {
+                    Debug.LogWarning(string.Format(
+                        "[FbxConverter] 贴图 {0}: {1}", texture.assetPath, problem));
+                }
+            }
+
+            foreach (StaticMeshEntry mesh in statics)
+            {
+                if (mesh.problems.Count == 0)
+                {
+                    Debug.Log(string.Format(
+                        CultureInfo.InvariantCulture,
+                        "[FbxConverter] 静态网格 {0}: OK（{1} 个渲染器，{2} 三角形，{3} 个材质，"
+                        + "尺寸 {4:F3}x{5:F3}x{6:F3} m）",
+                        mesh.name, mesh.rendererCount, mesh.triangleCount,
+                        mesh.materialNames.Count, mesh.widthMetres, mesh.heightMetres,
+                        mesh.depthMetres));
+                }
+                else
+                {
+                    foreach (string problem in mesh.problems)
+                    {
+                        Debug.LogWarning(string.Format(
+                            "[FbxConverter] 静态网格 {0}: {1}", mesh.name, problem));
+                    }
+                }
+            }
+
+            int problems = entries.Sum(e => e.problems.Count)
+                           + textures.Sum(t => t.problems.Count)
+                           + statics.Sum(s => s.problems.Count);
+            int notices = entries.Sum(e => e.notices.Count)
+                          + statics.Sum(s => s.notices.Count);
             Debug.Log(string.Format(
                 CultureInfo.InvariantCulture,
-                "[FbxConverter] 导入完成：{0} 个角色，{1} 条问题，{2} 条提示。报告：{3}",
-                entries.Count, problems, notices, reportPath));
+                "[FbxConverter] 导入完成：{0} 个角色，{1} 个静态网格，{2} 个贴图，"
+                + "{3} 条问题，{4} 条提示。报告：{5}",
+                entries.Count, statics.Count, textures.Count, problems, notices, reportPath));
         }
 
         private static string Bool(bool value)

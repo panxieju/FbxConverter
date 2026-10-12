@@ -50,9 +50,10 @@ python -m fbxconv.ui.app
 五步流程与规格一致：
 
 1. **选择目录** —— Unreal Editor、Unreal 资源目录、Unity 输出目录、挂载方式
-2. **扫描资源** —— 进度、资源数量、骨架组、缺失依赖
-3. **选择转换内容** —— 勾选骨架组、指定参考网格、逐个取消不需要的动作
-4. **设置导出** —— Humanoid／Generic、采样率、循环、Root Motion、缩放
+2. **扫描资源** —— 进度、资源数量、转换组、静态网格数、贴图数、缺失依赖
+3. **选择转换内容** —— 骨骼组：勾选组、指定参考网格、逐个取消不需要的动作；
+   静态网格组：按目录成组，逐个勾选要导出的网格
+4. **设置导出** —— Humanoid／Generic、采样率、循环、Root Motion、缩放、是否导出贴图
 5. **开始转换** —— 总进度、逐项状态、日志、取消、重试失败项、打开输出目录
 
 ### 命令行
@@ -71,6 +72,12 @@ python -m fbxconv convert H:\Packs\MyPack\Content --out G:\Out --all
 # 只导出某一个骨架组，按 Humanoid 导入
 python -m fbxconv convert H:\Proj\Content --out G:\Out --group Mannequin_UE4 --import-type Humanoid
 
+# 只导出静态网格（连同材质与贴图）
+python -m fbxconv convert H:\Proj\Content\EnvPack --out G:\Out --all --mode static
+
+# 只要网格，不要贴图
+python -m fbxconv convert H:\Proj\Content\EnvPack --out G:\Out --all --mode static --no-textures
+
 # 导出后直接在 Unity/团结引擎 中批处理导入 + 校验
 python -m fbxconv convert H:\Proj\Content --out G:\Out --all `
   --unity-import --project G:\MyUnityProject
@@ -78,6 +85,9 @@ python -m fbxconv convert H:\Proj\Content --out G:\Out --all `
 # 只跑 Unity 侧导入（对已有导出结果）
 python -m fbxconv unity-import G:\Out\UnityExport --project G:\MyUnityProject
 ```
+
+> `--out` 请用**绝对路径**：Unreal 进程的工作目录与当前终端不同，
+> 相对路径会被解析到引擎目录下。
 
 ---
 
@@ -98,17 +108,21 @@ python -m fbxconv unity-import G:\Out\UnityExport --project G:\MyUnityProject
                  ┌──────────────────────────────────────────┐
                  │ 3. Unreal 确认（headless）                │
                  │    AssetRegistry 判定类型与依赖           │
-                 │    加载网格/动画读取真实 Skeleton          │
+                 │    加载网格读真实 Skeleton / 材质槽        │
+                 │    再由材质依赖图解析出所用贴图            │
                  └──────────────────┬───────────────────────┘
                                     ▼
                  ┌──────────────────────────────────────────┐
-                 │ 4. 按 Skeleton 分组 → 用户选择            │
+                 │ 4. 分组 → 用户选择                        │
+                 │    骨骼：按 Skeleton；静态：按 Content 目录│
                  └──────────────────┬───────────────────────┘
                                     ▼
                  ┌──────────────────────────────────────────┐
-                 │ 5. 单次 Unreal 启动批量导出 FBX           │
+                 │ 5. Unreal 批量导出                        │
                  │    SkeletalMeshExporterFBX                │
                  │    AnimSequenceExporterFBX                │
+                 │    StaticMeshExporterFBX                  │
+                 │    TextureExporterPNG（另一次启动，见下）  │
                  └──────────────────┬───────────────────────┘
                                     ▼
                  ┌──────────────────────────────────────────┐
@@ -117,6 +131,7 @@ python -m fbxconv unity-import G:\Out\UnityExport --project G:\MyUnityProject
                                     ▼
                  ┌──────────────────────────────────────────┐
                  │ 7. Unity 批处理导入 + 校验                │
+                 │    贴图导入设置 + 材质资产 + 回填到模型    │
                  └──────────────────────────────────────────┘
 ```
 
@@ -142,6 +157,32 @@ python -m fbxconv unity-import G:\Out\UnityExport --project G:\MyUnityProject
   扫描阶段无此依赖，仍可使用 `-nullrhi` 加速。
 - **注册表就绪**：编辑器启动后约 6 秒 AssetRegistry 才完成首次收集，而
   `-ExecutePythonScript` 正好落在这个窗口内。导出前会显式等待注册表就绪。
+
+### 静态网格的贴图是怎么“打包”进去的
+
+**先说结论：Unreal 的 FBX 导出器无法把贴图写进 FBX，这是引擎源码里写死的。**
+（`FbxMainExport.cpp:303` 的 `bool bEmbedMedia = false;`，以及
+`IOS_REF.SetBoolProp(EXP_FBX_EMBEDDED, bEmbedMedia)`；`FbxExportOption`
+也没有任何相关开关——实测逐项尝试 `export_textures` / `embed_textures` /
+`export_materials` 全被拒绝。）它写进 FBX 的只是**原作者机器上的绝对路径**，
+例如 `U:/Dropbox/SyntyStudios/.../Texture_01_A.png`，在本机并不存在。
+
+所以本工具的做法是：
+
+1. Unreal 侧导出静态网格 FBX（材质名会被写进 FBX 的材质节点）；
+2. 从**材质依赖图**解析出该网格用到的贴图，用 `TextureExporterPNG` 导出成 PNG，
+   放到 `StaticMeshes/_Textures/<Content 相对路径>/`；
+3. `manifest.json` 记录「网格 → 材质槽 → 贴图」的完整映射；
+4. Unity 侧的 `UnrealResourceImporter.cs` 按映射设置贴图导入参数
+   （法线图设 `NormalMap` 且关闭 sRGB）、创建共享 Material 资产、
+   并用 `SearchAndRemapMaterials` 把模型指到这些材质上。
+
+结果是：**把 `UnityExport` 放进 Unity，模型就是带贴图的**，不需要手工拖拽。
+
+> 贴图导出单独占用一次编辑器启动。原因是 `UTextureExporterPNG` 会对源格式执行
+> 原生 `check()`，失败时**直接杀死编辑器进程**而不是抛异常；分开跑可以保证
+> 贴图崩溃不会带走已经完成的数千个 FBX。脚本每导出一张就落盘一次结果，
+> 因此崩溃后仍能知道进度并只重试剩下的部分。
 
 ---
 
@@ -216,6 +257,8 @@ Window > General > Test Runner > EditMode > FbxConverter.Tests
 | Unity 导入 | 自动配置 Humanoid／Generic，验证尺寸、朝向、Avatar 和根骨运动 | ✅ | `Reports/unity_import_report.json` |
 | UE5 支持 | Manny／Quinn 独立预设通过实际网格及动画验证 | ✅ | `--group Mannequins` |
 | 独立目录支持 | 没有 `.uproject` 时保留资源路径并在转换项目中成功加载 | ✅ | 扫描输出中的“转换项目” |
+| 静态网格输出 | 指定资产目录，遍历并导出其中的网格 FBX | ✅ | `--mode static --all` |
+| 材质与贴图随包 | 网格在 Unity 中直接带材质与贴图，不需要手工拖拽 | ✅ | `Reports/unity_import_report.json` + 独立脚本核对 |
 
 ### 实测结果
 
@@ -252,6 +295,39 @@ Unity：1/1 角色通过
 - **引擎版本跟随工程声明。** `.uproject` 里的 `EngineAssociation` 优先于“本机最新版本”，
   避免 5.4 工程被 5.8 编辑器打开而触发资源升级；未安装该版本时会告警并回退。
 
+### C. 静态网格 + 材质 + 贴图（UE 5.4 + 团结引擎 1.9.3）
+
+**完整素材包 `PolygonApocalypse`（1926 个网格）**
+
+```
+扫描：2612 个资源 → 10 个静态网格组 / 1926 个网格 / 14 张贴图，用时 371 秒
+导出：1926/1926 FBX + 14/14 PNG 全部成功，0 失败，约 7 分钟
+交付：126 MB（FBX 114.2 MB + PNG 9.8 MB），manifest.json 704 KB
+布局：StaticMeshes/Meshes/{Buildings,Props,Weapons,Vehicles,Items,Environments,...}
+      StaticMeshes/_Textures/PolygonApocalypse/...
+槽位：1999 个材质槽，0 个网格缺槽；13 个材质，无同名冲突
+```
+
+**子集 `Meshes/Buildings`（301 个网格）在 Unity 中的独立核对**
+
+用一次性 Editor 脚本（跑完即删）直接读 Unity 资产，不依赖我们自己写的报告：
+
+```
+模型        : 301 个，共 325 处材质引用
+             325/325 指向 StaticMeshes/Materials/*.mat
+             Unity 默认材质 0 个，子资产兜底 0 个
+贴图        : 3 张全部导入，sRGB 与类型正确
+材质        : 4 个 Standard 材质，_MainTex 指向导出的 PNG
+尺寸        : SM_Bld_Apartment_01 9.570 x 14.879 x 10.313 m（厘米→米换算正确）
+降采样告警  : T_PolygonApocalypse_01_A 源 4096² → Unity 导入 2048²
+             （Unity 默认 maxTextureSize=2048；导入报告里会明确列出，见 §8）
+```
+
+**已知代价**：静态网格的扫描明显慢于骨骼内容——UE 在 `load_asset` 时就要**构建**网格
+（实测约 0.4 秒/个复杂建筑网格、0.2 秒/个简单道具）。
+实测 `-nullrhi` 与 `r.GenerateMeshDistanceFields 0` 各只影响约 9% / 12%，
+所以这是加载本身的开销，不是可以关掉的开关。
+
 ---
 
 ## 6. 测试
@@ -261,8 +337,9 @@ python -m pytest tests -q
 ```
 
 单元测试覆盖：目录解析与 `.uproject` 查找、伴随文件识别、包路径换算、
-资源分类、骨架分组与命名去重、挂载点推断、循环推断、
-`profile.json`/`manifest.json`/`export_report.json` 生成、配置持久化。
+资源分类、骨架分组与命名去重、静态网格按目录分组、贴图计划与共享贴图池、
+`manifest.json` 三张表（贴图/材质/网格）、PNG 尺寸探测、FBX 与贴图重试拆分、
+挂载点推断、循环推断、`profile.json`/`manifest.json`/`export_report.json` 生成、配置持久化。
 
 ---
 
@@ -302,12 +379,23 @@ pyinstaller --clean --noconfirm FbxConverter.spec
 
 - **仅支持普通编辑器资源**；打包后的 `.pak` / `.utoc` / `.ucas` 会被识别并跳过，
   并在扫描警告中列出。
-- **保留材质槽，但不还原完整 Unreal 材质图**；Physics Asset 与动画蓝图不承诺自动还原。
+- **骨骼网格保留材质槽，但不还原完整 Unreal 材质图**；Physics Asset 与动画蓝图不承诺自动还原。
+- **静态网格还原三类贴图槽**（基色 / 法线 / 遮罩）。判定依据是 Unreal 能给出的权威信号
+  （法线看 `TC_NORMALMAP` 与命名、线性数据看 sRGB 关闭），**不是**从材质图读取的真实连接——
+  因为 `MaterialEditingLibrary.get_used_textures()` 实测返回空、而 `Material.expressions`
+  在 Python 侧被保护。复杂材质图（叠加、遮罩运算、顶点色混合）不还原。
+- **贴图不会嵌入 FBX**（引擎源码写死，见 §3 末尾），而是作为 PNG 与 FBX 并排输出，
+  由 Unity 侧脚本自动装配。交付物是「FBX + PNG + manifest.json」，不是一个自包含 FBX。
+- **大于 2048 的贴图会被 Unity 默认上限降采样**（例如 4096² → 2048²）。
+  导入报告会明确列出每一张被降采样的贴图。本工具不改 Unity 的默认值，
+  因为那会让显存占用翻两番——需要原始尺寸请在 TextureImporter 上调高 `maxTextureSize`。
+- **静态网格的扫描比骨骼内容慢**：UE 在加载时就要构建网格，实测约 0.2–0.4 秒/个。
+  1926 个网格的包扫描约 6 分钟（导出本身约 5 分钟）。
 - **不同 Skeleton 分别导出**，不做跨骨架自动重定向。
 - **采样率、循环、Root Motion 在 Unity 侧生效**（写入 `profile.json` 由 C# 导入器应用），
   刻意不在导出时修改 Unreal 资源——独立转换项目下那些资源可能是用户的原文件。
-- Unreal 与 Unity 的启动开销是主要耗时。扫描与导出各需一次引擎启动，
-  因此 GUI 的“重试失败项”只会重新启动一次 Unreal。
+- Unreal 与 Unity 的启动开销是主要耗时。扫描、FBX 导出、贴图导出各需一次引擎启动，
+  因此 GUI 的“重试失败项”只会重新启动必要的那几次。
 
 ## 9. 排错
 
@@ -320,6 +408,10 @@ pyinstaller --clean --noconfirm FbxConverter.spec
 | 工程是 5.4 却用 5.8 打开 | 现在会自动读取 `.uproject` 的 `EngineAssociation`；若本机没装该版本会告警并回退 |
 | 导出全部失败：`无法加载资源` | 确认资源目录与 `.uproject` 是否匹配；转换项目应在 `<输出目录>/.fbxconv/UnrealProject` |
 | Unreal 崩溃于 `SkinnedMeshComponent` 断言 | 导出阶段被加了 `-nullrhi`；移除该参数 |
+| 贴图批次中途结束，日志无异常 | `TextureExporterPNG` 对源格式的原生 `check()` 失败会直接杀进程。已完成的贴图都在磁盘上，用“重试失败项”续跑即可 |
+| 某张贴图报“虚拟贴图不支持 PNG 导出” | 该贴图是 Virtual Texture；需要先转成普通 Texture2D |
+| 某些网格仍是 Unity 默认材质 | 该网格在 Unreal 里没有材质槽，或 FBX 里没有可绑定的材质节点；报告里会逐条列出 |
+| 模型有贴图但看起来偏软 | 贴图被 `maxTextureSize` 降采样了；报告里有具体尺寸，调高该值后重新导入 |
 | Unity 报 `CS0101` 重复定义 | 同一份 C# 被放进了两个目录；只保留 `Assets/UnityExport/Editor/` 一处 |
 | Unity 报找不到 `NUnit` | 项目未安装 Test Framework；删除 `Editor/Tests/` 即可（导入器本身不受影响） |
 | 报告里根运动全为 0 | 早期版本只识别 Generic 的 `m_LocalPosition`；Humanoid 走 `RootT.*` 肌肉曲线，现已同时支持 |

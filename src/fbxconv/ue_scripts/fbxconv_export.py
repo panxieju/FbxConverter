@@ -113,11 +113,17 @@ def _make_exporter(kind):
     import unreal
 
     if kind == "skeletal_mesh":
-        exporter_class = unreal.SkeletalMeshExporterFBX
+        exporter_class = getattr(unreal, "SkeletalMeshExporterFBX", None)
+    elif kind == "static_mesh":
+        # Verified present on UE 5.4 and 5.8 (``UStaticMeshExporterFBX``).
+        exporter_class = getattr(unreal, "StaticMeshExporterFBX", None)
     elif kind == "anim_sequence":
-        exporter_class = unreal.AnimSequenceExporterFBX
+        exporter_class = getattr(unreal, "AnimSequenceExporterFBX", None)
     else:
         raise RuntimeError("unsupported export kind: %s" % kind)
+
+    if exporter_class is None:
+        raise RuntimeError("该引擎版本没有 %s 的 FBX 导出器" % kind)
 
     try:
         return exporter_class()

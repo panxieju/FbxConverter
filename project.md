@@ -6,27 +6,32 @@
 
 ## 1. 项目定位
 
-把 Unreal Engine 工程里的**骨骼网格**与**动画序列**批量转换成 Unity 可直接使用的
-FBX 包，并把 Unity 侧的导入配置与校验一并自动化。
+把 Unreal Engine 工程里的**骨骼网格 + 动画序列**与**静态网格 + 材质 + 贴图**
+批量转换成 Unity 可直接使用的 FBX 包，并把 Unity 侧的导入配置与校验一并自动化。
 
 ### 目标
 
 | # | 目标 | 落地方式 |
 |---|---|---|
 | G1 | 类型判断必须权威 | 只做文件发现，类型/依赖一律由 Unreal AssetRegistry + 实际加载确认 |
-| G2 | 按骨架组织 | 以 Skeleton 为键分组网格与动画，逐组选择与导出 |
+| G2 | 按内容组织 | 骨骼内容以 Skeleton 为键分组；静态网格以 `Content` 目录为键分组 |
 | G3 | 路径可追溯 | 输出保留相对于 `Content` 的资源路径 |
 | G4 | 源目录只读 | 转换产物写入独立工作目录；跨骨架不自动重定向 |
 | G5 | 无工程也能用 | 找不到 `.uproject` 时生成独立转换项目，零拷贝挂载源目录 |
 | G6 | 失败可定位 | 逐项结果 + 具体缺失路径 + 可重试 |
+| G7 | 贴图跟着模型走 | 静态网格所用的材质与贴图**一并导出**，并由 Unity 侧脚本自动装配 |
 
 ### 非目标（第一版明确不做）
 
 - `.pak` / `.utoc` / `.ucas` 打包产物（会识别并跳过，且在警告中列出）。
-- 完整 Unreal 材质图还原；仅保留材质槽。
+- 完整 Unreal 材质图还原；骨骼网格仅保留材质槽。
+- 静态网格的**任意**材质图还原：只还原「基色 / 法线 / 遮罩」三类贴图槽
+  （判定依据见 §6.16），材质节点里的算术与混合不还原。
 - Physics Asset 与动画蓝图还原。
 - 跨 Skeleton 自动重定向。
 - 导出时改写 Unreal 资源（见 §6.5）。
+- 把贴图二进制**嵌入** FBX。引擎源码层面做不到（见 §6.14），
+  替代方案是「PNG 随包 + Unity 侧自动装配」，语义上等价于“贴图和材质一起打包”。
 
 ---
 
@@ -58,21 +63,21 @@ FBX 包，并把 Unity 侧的导入配置与校验一并自动化。
 | 模块 | 职责 | 关键类型 |
 |---|---|---|
 | `errors.py` | 异常层级，每个错误带 `code` 与可读细节 | `FbxConvError` → `UnrealRunError` / `UnrealScriptError` / `ContentRootError` … |
-| `models.py` | 领域模型；全部可 JSON 序列化 | `AssetKind` `AssetRecord` `SkeletonGroup` `ConversionPlan` `ExportOutcome` |
+| `models.py` | 领域模型；全部可 JSON 序列化 | `AssetKind` `AssetRecord` `SkeletonGroup` `GroupKind` `TextureRequest` `ConversionPlan` `ExportOutcome` |
 | `discover.py` | 纯文件系统发现：`.uasset`、伴随文件、`.uproject`、打包产物 | `SourceFile` `DiscoveryResult` |
 | `resources.py` | 定位随包数据（源码树 / PyInstaller 冻结） | `package_root()` `ue_scripts_dir()` `templates_dir()` |
 | `config.py` | 用户配置持久化（`%APPDATA%/FbxConverter/config.json`） | `AppConfig` |
 | `logutil.py` | 统一日志 + 回调 Handler（喂给 GUI 日志面板） | `configure_logging` `CallbackHandler` |
-| `report.py` | 导出报告 | `ExportReport` |
+| `report.py` | 导出报告（FBX 与贴图分别计数） | `ExportReport` |
 | `unreal/locator.py` | 注册表 / Launcher / 目录扫描定位引擎，并**校验可执行文件存在**；按 `.uproject` 的 `EngineAssociation` 选引擎 | `UnrealInstall` `resolve_install_for_project` `project_engine_association` |
 | `unreal/project.py` | 独立转换项目：生成 `.uproject` + 挂载 `Content` | `ConversionProject` `MountMode` |
 | `unreal/paths.py` | 文件系统 ↔ Unreal 包路径换算 | `to_package_path` `package_to_object` … |
 | `unreal/runner.py` | 无头启动编辑器、传递 job、回收 result、流式事件、取消 | `UnrealRunner` `UnrealScriptResult` |
-| `pipeline/scan.py` | 发现 → 定范围 → Unreal 确认 → 按骨架分组 → 依赖诊断 | `ScanSession` `group_assets` `diagnose_dependencies` |
-| `pipeline/export.py` | 计划 → 单次批量导出 → 写产物 | `ExportSession` `build_plan` |
-| `unity/manifest.py` | 生成 `manifest.json` / `profile.json`，投放 Editor 脚本 | `build_profile_payload` `install_unity_support` |
+| `pipeline/scan.py` | 发现 → 定范围 → Unreal 确认 → 分组（骨架 / 静态目录）→ 依赖诊断 | `ScanSession` `group_assets` `group_static_meshes` |
+| `pipeline/export.py` | 计划 → 批量导出 FBX → 批量导出贴图 → 写产物 | `ExportSession` `build_plan` `build_texture_requests` `png_size` |
+| `unity/manifest.py` | 生成 `manifest.json` / `profile.json`（含贴图与材质表），投放 Editor 脚本 | `build_static_materials` `build_manifest_payload` `install_unity_support` |
 | `unity/runner.py` | 定位并批处理驱动 Unity/团结引擎 | `UnityInstall` `run_batch_import` |
-| `ue_scripts/` | **在 Unreal 内执行**的脚本（详见 §5） | `fbxconv_common/scan/export.py` |
+| `ue_scripts/` | **在 Unreal 内执行**的脚本（详见 §5） | `fbxconv_common/scan/export/textures.py` |
 | `unity/templates/` | **在 Unity 内执行**的 C# 与 asmdef | `UnrealResourceImporter.cs` |
 
 ---
@@ -105,30 +110,56 @@ AssetRecord[]  ──group_assets()──▶  SkeletonGroup[]  ──▶  ScanRe
 用户选择 SelectedGroup[] + ExportSettings
   │ build_plan()          展平为 ExportRequest[]，分配 rel 路径并去重
   ▼
-ConversionPlan
-  │ 单次 UnrealRunner.run_script("fbxconv_export.py", {exports[]})
+ConversionPlan{groups[], texture_requests[]}
+  │ 第一次 UnrealRunner.run_script("fbxconv_export.py", {exports[]})
   │      等待注册表就绪 → 逐个 AssetExportTask → 逐项回传
+  │ 第二次 UnrealRunner.run_script("fbxconv_textures.py", {textures[]})   ← 仅静态网格
   ▼
 ExportOutcome[]  ──▶  profile.json × N  ──▶  manifest.json
                  ──▶  export_report.json
                  ──▶  Editor/ 脚本投放
 ```
 
-### 4.3 Unity 导入
+两次启动是刻意分开的：`UTextureExporterPNG` 会对源格式执行**原生 `check()`**，
+断言失败直接杀死编辑器进程（不是抛 Python 异常），因此贴图批次绝不能让
+已经完成的 FBX 工作陪葬（见 §6.15）。
+
+### 4.3 静态网格与贴图（`fbxconv_textures.py` 侧）
+
+```
+静态网格组（按 Content 目录分组）
+  │ build_texture_requests()   取所有网格引用贴图的并集，落到共享贴图池
+  ▼
+StaticMeshes/_Textures/<包的 Content 相对路径>.png
+  │ fbxconv_textures.py  逐个 load → 安全检查 → TextureExporterPNG
+  │                     每导出一张就重写一次 result.json（崩溃可续）
+  ▼
+texture_metadata{package → srgb / texture_kind / width / height}
+  │ png_size() 读 IHDR 记下真实尺寸（Unity 默认 maxTextureSize=2048，会静默降采样）
+  ▼
+manifest.json 的 textures[] / materials[] / staticMeshes[]
+```
+
+### 4.4 Unity 导入
 
 ```
 Unity/Tuanjie.exe -batchmode -executeMethod ...ImportFromCommandLine
-  │ 环境变量 FBXCONV_UNITY_EXPORT 或 fbxs 回退到 Assets/UnityExport
+  │ 环境变量 FBXCONV_UNITY_EXPORT 或回退到 Assets/UnityExport
   ▼
-逐角色：配置 ModelImporter → 生成/复用 Avatar → 配置每个 clip → 校验
+骨骼内容：配置 ModelImporter → 生成/复用 Avatar → 配置每个 clip → 校验
+静态内容：导入贴图（sRGB / NormalMap）→ 建共享 Material 资产
+          → ModelImporter.SearchAndRemapMaterials 把模型指到这些材质上 → 校验
   ▼
 Reports/unity_import_report.json
 ```
 
-### 4.4 重试语义
+### 4.5 重试语义
 
 `ExportSession.run(requests, previous=...)` 把本次结果与 `previous` 按
-`output_rel` 合并，因此“重试失败项”只重启一次 Unreal，且报告仍覆盖全量。
+`output_rel` 合并，因此“重试失败项”只重启必要的编辑器，且报告仍覆盖全量。
+
+失败项先按 `AssetKind.TEXTURE` 拆成两批：FBX 批次与贴图批次各自只跑自己那部分，
+避免把贴图请求塞给 FBX 导出器（那会以 “unsupported export kind: texture” 失败）。
 
 ---
 
@@ -219,9 +250,10 @@ Unreal 侧 `print("FBXCONV:" + json)`，主机按前缀解析并转发给 UI：
 {
   "mount_point": "/Game",
   "settings": { "import_type": "Generic", "sampling_rate": 30,
-                "loop_mode": "auto", "root_motion": "keep", "scale": 1.0 },
+                "loop_mode": "auto", "root_motion": "keep", "scale": 1.0,
+                "export_materials": true, "export_textures": true },
   "exports": [{
-    "kind": "skeletal_mesh",              // skeletal_mesh | anim_sequence
+    "kind": "skeletal_mesh",              // skeletal_mesh | static_mesh | anim_sequence
     "package_path": "/Game/.../SK_Mannequin",
     "object_path":  "/Game/.../SK_Mannequin.SK_Mannequin",
     "output_rel":   "Characters/Mannequin_UE4/Mesh/SK_Mannequin.fbx",
@@ -242,6 +274,32 @@ Unreal 侧 `print("FBXCONV:" + json)`，主机按前缀解析并转发给 UI：
 
 **单项失败不影响整批**：每项独立 `try/except`，错误文本进 `error`，主机标记
 `retryable=True`。
+
+### 5.3.1 贴图导出 job / result（`fbxconv_textures.py`）
+
+```jsonc
+// job
+{ "textures": [{
+    "package_path": "/Game/PolygonApocalypse/Textures/T_X",
+    "output_path":  "G:/out/UnityExport/StaticMeshes/_Textures/PolygonApocalypse/Textures/T_X.png",
+    "display_name": "T_X" }] }
+```
+
+```jsonc
+// data
+{ "complete": true, "total": 7, "succeeded": 7, "failed": 0,
+  "engine_version": "5.4.4-...",
+  "results": [{
+    "package_path": "/Game/.../T_X", "output_path": "G:/out/.../T_X.png",
+    "ok": true, "error": null, "size": 2185513, "elapsed": 0.05,
+    "srgb": true, "compression": "TC_DEFAULT", "texture_class": "Texture2D",
+    "source_file": "U:/Dropbox/SyntyStudios/.../T_X.png",
+    "texture_kind": "baseColor" }] }
+```
+
+`complete` 是**崩溃探针**：脚本在循环前和每导出一张后都重写一次 result，
+所以即使编辑器在导出中途被原生断言杀死，主机仍能读到 `complete: false`
+以及已完成的部分，并把剩下的项标成可重试（见 §6.15）。
 
 ### 5.4 主机 → Unity
 
@@ -283,6 +341,46 @@ Unreal 侧 `print("FBXCONV:" + json)`，主机按前缀解析并转发给 UI：
   }],
   "materials": [{ "name": "M_MannequinUE4_Body", "unrealMaterial": "/Game/..." }],
   "missingDependencies": [], "notes": []
+}
+```
+
+静态网格**没有** `profile.json`：它没有骨架、Avatar 或剪辑集可描述，
+全部信息都在 `manifest.json` 的三张表里。三张表互相用**名字与下标**引用，
+而不是嵌套展开——实测 1926 个网格的包若把材质表复制到每个网格，
+JSON 会膨胀一个数量级，而 `JsonUtility` 要整体解析它。
+
+```jsonc
+// manifest.json（静态网格部分，节选）
+{
+  "staticMeshCount": 5, "textureCount": 7, "materialCount": 4,
+
+  // 贴图表：name 是表内唯一键（不同包同名贴图会得到 _1 后缀）
+  "textures": [{
+    "name": "T_PolygonApocalypse_01_A",
+    "path": "StaticMeshes/_Textures/PolygonApocalypse/Textures/T_PolygonApocalypse_01_A.png",
+    "unrealPackage": "/Game/PolygonApocalypse/Textures/T_PolygonApocalypse_01_A",
+    "srgb": true, "textureType": "baseColor", "unrealClass": "Texture2D",
+    "bytes": 2185513, "width": 2048, "height": 2048
+  }],
+
+  // 材质表：Unity 侧据此建 Material 资产并按名回填到模型
+  "materials": [{
+    "name": "Mat_PolygonApocalypse_01_A",
+    "unrealMaterial": "/Game/PolygonApocalypse/Materials/Mat_PolygonApocalypse_01_A",
+    "baseColor": "T_PolygonApocalypse_01_A",
+    "normal": "", "mask": "",
+    "allTextures": ["T_PolygonApocalypse_01_A"]
+  }],
+
+  // 网格表：slots 用 materialIndex 指回材质表
+  "staticMeshes": [{
+    "name": "SM_Bld_Apartment_01",
+    "fbx": "StaticMeshes/Meshes/Buildings/SM_Bld_Apartment_01.fbx",
+    "unrealPackage": "/Game/PolygonApocalypse/Meshes/Buildings/SM_Bld_Apartment_01",
+    "group": "Meshes_Buildings", "relativeDir": "Meshes/Buildings",
+    "triangleHint": 128, "slotCount": 1,
+    "slots": [{ "slotName": "PolygonApocalypse_Mat_01_A", "materialIndex": 0 }]
+  }]
 }
 ```
 
@@ -410,6 +508,143 @@ PyQt5 从 C++ 调用 Python 槽函数时，逃逸的异常不会只是打印堆�
 `configure_logging()`，日志级别停在 WARNING，记录从未进到面板——
 `tests/test_ui_logging.py` 现在专门驱动这条链路。
 
+### 6.14 贴图**无法**嵌入 FBX：这是引擎硬编码，不是配置项
+
+需求原话是“贴图和材质一起打包进 fbx”。查了 UE 5.4 的引擎源码后确认做不到：
+
+```cpp
+// Engine/Source/Editor/UnrealEd/Private/Fbx/FbxMainExport.cpp:303,326
+void FFbxExporter::WriteToFile(const TCHAR* Filename)
+{
+    bool bEmbedMedia = false;            // ← 写死
+    ...
+    IOS_REF.SetBoolProp(EXP_FBX_EMBEDDED, bEmbedMedia);
+```
+
+`UFbxExportOption` 也**没有任何**相关开关。实测（UE 5.4）逐个尝试
+`export_textures` / `embed_textures` / `export_materials` / `media` / `texture_format`
+全部被 `set_editor_property` 拒绝；该类的完整属性只有 13 个：
+`ascii / bake_actor_animation / bake_camera_and_light_animation / collision /
+export_local_time / export_morph_targets / export_preview_mesh / export_source_mesh /
+fbx_export_compatibility / force_front_x_axis / level_of_detail /
+map_skeletal_motion_to_root / vertex_color`。
+
+导出结果也印证了这一点：对一个真实静态网格导出的 FBX 里
+`Content` 节点数 = 0、无 PNG/JPEG 字节，但 `Video` 节点 6 个、`Texture` 节点 25 个，
+并且记录的贴图路径是**原作者机器上的绝对路径**：
+
+```
+U:/Dropbox/SyntyStudios/PolygonApocalypse/_Working/Textures/Alts/PolygonApocalypse_Texture_01_A.png
+```
+
+该路径在本机不存在（`AssetImportData->GetFirstFilename()` 指向的就是它）。
+即便 FbxExportOption 能嵌，路径也是错的。
+
+更糟的是 `FFbxExporter::ExportMaterial()` 只在**槽位由贴图参数节点驱动**时才写贴图
+节点（要求 `Expression->GetParameterName() != NAME_None` 且
+`Value->AssetImportData` 非空）；普通 `TextureSample` 节点的材质在 FBX 里
+连一张贴图都没有，只剩一个颜色。
+
+**结论与取舍**：既然 FBX 里注定只有（甚至没有）失效引用，就把贴图**单独导出成 PNG**
+与 FBX 并排放进同一个交付目录，再由我们自己投放的 `UnrealResourceImporter.cs`
+按 `manifest.json` 建材质并回填。对用户而言结果一致——“模型进 Unity 就带着贴图”，
+而且绕开了上面两个引擎缺陷。
+
+### 6.15 贴图导出必须独立于 FBX 导出
+
+`UTextureExporterGeneric::ExportBinary` 里有一句原生断言：
+
+```cpp
+// EditorFactories.cpp:4974,4981
+UTexture* Texture = GetExportTexture(Object);
+UTexture2D* Texture2D = Cast<UTexture2D>(Texture);
+check( Texture2D != nullptr );
+check( SupportsTexture(Texture) );
+```
+
+`check` 失败**不会**抛 Python 异常，而是直接终止编辑器进程（实测退出码 3，
+日志里是 `Assertion failed: SupportsTexture(Texture)`）。
+`SupportsTexture` 对 PNG 的实现是 `!IsHDR(ConvertToRawImageFormat(Source.GetFormat()))`，
+而 `Source` 在 Python 里读不到——也就是说**无法在调用前完全判定安全性**。
+
+于是采取三层防护：
+
+1. **分两次启动编辑器**：贴图批次崩溃不会带走已经完成的 FBX。
+2. **崩溃前先落盘**：`fbxconv_textures.py` 在循环前和每张之后重写 `result.json`，
+   主机据 `complete: false` 判定“崩溃于第 N 张之后”，其余项标为可重试。
+3. **能查的先查**：跳过非 `Texture2D`、跳过 `virtual_texture_streaming`、
+   跳过 `TC_HDR/HalfFloat`（这些是已知会让断言失败的输入）。
+   绝不再实例化抽象基类 `TextureExporterGeneric`——最初那次崩溃正是它。
+
+### 6.16 贴图角色靠 sRGB + 压缩设置推断，而不是靠材质图
+
+`MaterialEditingLibrary.get_used_textures()` 看起来是标准答案，但实测对
+`/Game/PolygonApocalypse/Materials/Mat_PolygonApocalypse_01_A` 返回**空数组**
+（`get_texture_parameter_names` 同样为空），而 `Material.expressions` 又被
+Python 侧保护：`Property 'Expressions' is protected and cannot be read`。
+也就是说“哪个贴图接在 BaseColor 上”在 Python 里拿不到。
+
+改用 AssetRegistry 依赖图：`material → (MaterialInstance 父链, 最多 4 层) → Texture*`。
+实测能正确解析出 `Mat_PolygonApocalypse_01_A → T_PolygonApocalypse_01_A`，
+以及 `M_UE4Man_Body1_Inst1 → 7 张贴图`。
+
+角色归类只用 Unreal 能给出的**权威信号**：
+
+| 判定 | 依据 |
+|---|---|
+| `normal` | `compression_settings == TC_NORMALMAP`，或名字含 `_normal/_nrm/_norm` |
+| `mask` | `srgb == False`（线性数据：粗糙度/金属度/AO/遮罩） |
+| `baseColor` | 其余（sRGB 颜色数据） |
+
+这是**启发式**，所以在文档与报告里都如实标注；一个材质解析出多张同角色贴图时
+取第一张，并在 `allTextures` 里保留全部，方便人工核对。
+
+### 6.17 用 `SearchAndRemapMaterials` 而不是 `AddRemap`
+
+Unity 的模型导入器默认会在每个 FBX 旁生成自己的一套材质，同一个 Unreal 材质
+被 1900 个网格引用就会产生 1900 份副本，后续改一次材质要改 1900 次。
+
+做法是：**先**在 `StaticMeshes/Materials/` 下建好共享 Material 资产（名字就用
+Unreal 材质名，因为 `FFbxExporter::ExportMaterial` 正是用
+`MaterialInterface->GetName()` 命名 FBX 里的材质节点），**再**导入模型并让
+导入器按名回填：
+
+```csharp
+importer.materialImportMode = ModelImporterMaterialImportMode.ImportStandard;
+importer.materialName   = ModelImporterMaterialName.BasedOnMaterialName;
+importer.materialSearch = ModelImporterMaterialSearch.RecursiveUp;
+importer.SaveAndReimport();
+importer.SearchAndRemapMaterials(ModelImporterMaterialName.BasedOnMaterialName,
+                                 ModelImporterMaterialSearch.RecursiveUp);
+```
+
+`AddRemap(SourceAssetIdentifier, Object)` 也可行，但它要求我们自己拼出 FBX 内部
+材质名；`SearchAndRemapMaterials` 用同样的名字规则让 Unity 自己找，
+少一处可能对不上的假设。实测回填成功：模型的 `sharedMaterials` 指向
+`Assets/UnityExport/StaticMeshes/Materials/*.mat`，而不是 Unity 默认材质或子资产。
+
+Unity 版本差异已实测确认（团结引擎 2022.3.62t11）：
+`ModelImporterMaterialLocation{External,InPrefab}`、
+`ModelImporterMaterialImportMode{None,ImportStandard,LegacyImport,ImportViaMaterialDescription,Import}`、
+`SearchAndRemapMaterials`、`AddRemap` 均存在；`TextureImporter` 的
+`sRGBTexture/textureType/mipmapEnabled/wrapMode/maxTextureSize` 均存在。
+
+### 6.18 静态网格按 Content 目录分组，贴图共用一个池
+
+静态网格没有骨架，唯一的天然组织信息就是它所在的目录。于是分组键 =
+「选择目录」相对「挂载点」的父路径：选 `Content/PolygonApocalypse` 时，
+`.../Meshes/Buildings/SM_X` 落到 `StaticMeshes/Meshes/Buildings/`。
+实测 1926 个网格分到若干目录，而不是在一个扁平目录里堆 1926 个文件。
+
+贴图**不**跟着每个网格目录走：PolygonApocalypse 有 1926 个网格、十几个目录，
+共用的图集只有几张，按目录复制会让交付体积翻倍。
+贴图统一落到 `StaticMeshes/_Textures/<包的 Content 相对路径>/`，
+既保持无重名、又保留可读的来源路径。
+
+坐标与单位沿用骨骼链路已验证的默认值（不设 `useFileScale=false`）：
+实测 `1M_Cube` 导入后正好 1.000×1.000×1.000 m，说明 UE 的厘米 → Unity 的米
+换算在静态网格上同样正确。
+
 ---
 
 ## 7. 目录结构
@@ -435,12 +670,14 @@ FbxConverter/
       UnrealResourceImporter.cs  FbxConverter.Editor.asmdef
       Tests/{UnrealImportTests.cs, FbxConverter.Tests.asmdef}
     ue_scripts/                → 在 Unreal 内执行
-      fbxconv_common.py  fbxconv_scan.py  fbxconv_export.py
+      fbxconv_common.py  fbxconv_scan.py  fbxconv_export.py  fbxconv_textures.py
     ui/{app,main_window,pages,widgets,worker,__init__}.py
-  tests/                       114 个单元测试
+  tests/                       151 个单元测试
     test_discover.py           目录解析、.uproject 查找、伴随文件
     test_paths.py              包路径换算、文件名净化与去重
     test_models.py             资源分类、骨架分组、同名消歧、空组过滤
+    test_static_meshes.py      静态网格分组、贴图计划、manifest 三张表、
+                               PNG 尺寸探测、贴图/FBX 重试拆分
     test_engine_selection.py   引擎版本跟随声明、扫描范围推导
     test_artefacts.py          profile/manifest/report 生成、配置持久化
     test_diagnostics.py        挂载点不匹配诊断
@@ -580,8 +817,13 @@ dist\FbxConverter\FbxConverter.exe
 | 限制 | 影响 | 可选方向 |
 |---|---|---|
 | 每次扫描/导出各需一次引擎冷启动 | 交互式迭代偏慢 | 常驻编辑器 + 文件/套接字命令队列（§6.2 的延伸） |
+| 静态网格扫描必须**加载**网格，UE 会顺带构建它 | 实测 0.2–0.4 秒/个：1926 个网格的包扫描 371 秒（导出本身约 5 分钟） | 把材质/贴图发现整体挪到导出阶段（导出器本来就要加载网格），扫描只留文件+注册表；代价是导出前看不到贴图数量 |
 | 采样率不写回 Unreal | UE 侧帧率仍为原值 | 在显式勾选后于副本上改写 |
-| 材质仅保留槽位 | 需在 Unity 手工重连材质 | 生成材质映射 CSV，供 Unity 侧批量重绑 |
+| 骨骼网格的材质仅保留槽位 | 需在 Unity 手工重连材质 | 复用静态网格那套贴图导出 + 材质表生成（§6.16 同样适用于骨骼网格） |
+| 静态网格材质只还原三类贴图槽 | 复杂材质图（叠加、遮罩运算、顶点色混合）不还原 | 解析 `MaterialExpression` 子集并映射到 Shader Graph / HLSL |
+| 贴图角色是启发式判定 | 名字与压缩设置都不典型的贴图可能归错槽 | 从材质图取权威连接（需先解决 Python 侧 `expressions` 被保护的问题） |
+| 不嵌入 FBX，PNG 随包输出 | 交付物是「FBX + PNG + manifest」，不是一个自包含 FBX | 自写二进制 FBX 读写器注入 `Video.Content`；但需先实测 Unity 是否读取嵌入媒体 |
+| 大于 2048 的贴图会被 Unity 默认上限降采样 | 4K 图集进 Unity 变 2K | 已在导入报告里显式警告；可加“保持原始尺寸”选项 |
 | 无跨骨架重定向 | 不同骨架需分别导出 | 接入 IK Retargeter |
 | `Rigs/Poses/*_anim` 会被当作普通动画列出 | 选择列表偏长 | 依据 ControlRig 归属自动分组或默认折叠 |
 | `.pak/.utoc/.ucas` 不支持 | 打包资源需先解包 | 集成 UnrealPak 解包前置步骤 |
@@ -591,13 +833,21 @@ dist\FbxConverter\FbxConverter.exe
 
 ## 11. 验证记录
 
-三套真实素材上的端到端结果，作为回归基线：
+真实素材上的端到端结果，作为回归基线：
 
 | 场景 | 结果 |
 |---|---|
 | UE 模板 Mannequin（UE 5.8，独立目录） | 145 资源 / 3 组；42 个 FBX 一次导出 25.8s；2/2 角色通过，高度 1.813 / 1.833 m，Y(up) |
 | `Escape` 工程 `CLazyAnimpack`（UE 5.4，真实工程） | 声明 5.4 自动改用 5.4（默认会选 5.8）；范围收敛到 `/Game/CLazyAnimpack` → 300 资源；**213/213** 导出（1 网格 + 212 动画，44.9s） |
 | 同上，导入编辑器内的 Tuanjie 工程 | 1/1 通过；`SkinnedMeshRenderer.bounds` = (1.4075, **1.8329**, 0.4352) m，最高轴 Y；Avatar 有效且为人形（52 骨）；212 个剪辑 0 失败；根运动经 `averageSpeed` 确认为非零 m/s |
+| `CLazyAnimpack/Demo` 静态网格（UE 5.4） | 2 组 / 5 网格 / 7 贴图；**5/5 FBX + 7/7 PNG** 全部成功；目录布局 `StaticMeshes/{Materials,Meshes}/`，贴图 `StaticMeshes/_Textures/CLazyAnimpack/...` |
+| 同上，Unity 批处理导入（团结引擎 2022.3.62t11，Built-in 管线） | 5/5 网格 0 问题；`1M_Cube` 恰好 1.000×1.000×1.000 m；7 张贴图全部导入（`_N` → `NormalMap`/sRGB off，基色 → sRGB on，遮罩 → sRGB off） |
+| 同上，**独立脚本**交叉核对实际 Unity 资产 | 模型 `sharedMaterials` 指向 `Assets/UnityExport/StaticMeshes/Materials/*.mat`（不是默认材质、也不是子资产）；`M_UE4Man_Body1_Inst1` 的 `_MainTex`/`_BumpMap`/`_MetallicGlossMap` 分别指向导出的 PNG |
+| `PolygonApocalypse` 整包（UE 5.4，1926 网格） | 2612 资源 → 10 个静态组 / 1926 网格 / 14 贴图；**1926/1926 FBX + 14/14 PNG**，0 失败，约 7 分钟；交付 126 MB；1999 个材质槽 0 缺失；13 个材质无同名冲突 |
+| `PolygonApocalypse/Meshes/Buildings` 301 网格导入 Unity | 301/301 通过，0 问题；**325 处材质引用全部指向我们的材质资产**，Unity 默认材质 0 个；`SM_Bld_Apartment_01` = 9.570×14.879×10.313 m；4096² 贴图降采样到 2048² 并被如实告警 |
+| 扫描开销对照实验 | 301 个建筑网格：`-nullrhi` 131.4s vs 普通 RHI 119.4s；再加 `r.GenerateMeshDistanceFields 0` 在 102 个道具上 21.8s vs 19.3s。差异都在 10% 左右，说明开销来自加载构建本身 |
 
-最后一项是用 §8.4 的 MCP 方式在**用户已打开的编辑器**里验证的，
-不是批处理——两者结论一致。
+前两项中的骨骼部分是早期版本用 §8.4 的 MCP 方式在**用户已打开的编辑器**里验证的，
+不是批处理——两种方式结论一致。静态网格的独立核对同样绕开了我们自己写的报告：
+用一个一次性 Editor 脚本（跑完即删）直接读 `ModelImporter`、`TextureImporter`、
+`Renderer.sharedMaterials` 与 `Material.GetTexture()`，再把结果与导入报告对照。

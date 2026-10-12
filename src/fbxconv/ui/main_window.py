@@ -176,8 +176,9 @@ class MainWindow(QMainWindow):
             return f"引擎：{self.install.label}    等待扫描。"
         return (
             f"引擎：{self.install.label}    "
-            f"资源 {len(self.scan.assets)} 个 / 骨架组 {len(self.scan.groups)} 个 / "
-            f"动画 {self.scan.total_animations} 个"
+            f"资源 {len(self.scan.assets)} 个 / 转换组 {len(self.scan.groups)} 个 / "
+            f"静态网格 {self.scan.total_static_meshes} 个 / "
+            f"动画 {self.scan.total_animations} 个 / 贴图 {self.scan.total_textures} 个"
         )
 
     def checked_group_indices(self) -> list[int]:
