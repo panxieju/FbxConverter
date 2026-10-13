@@ -150,6 +150,13 @@ class DirectoryPage(WizardPage):
             self.mount_combo.addItem(mode.label, mode.value)
         self.mount_combo.currentIndexChanged.connect(lambda _: self._sync_and_refresh())
         form.addRow("独立项目挂载方式", self.mount_combo)
+
+        self.unity_project_picker = PathPicker(
+            mode="dir", placeholder="Unity/团结引擎 工程目录（可选，用于导入与打包）"
+        )
+        self.unity_project_picker.changed.connect(lambda _: self._sync_and_refresh())
+        form.addRow("Unity 工程目录", self.unity_project_picker)
+
         self.body.addWidget(dirs_box)
 
         self.project_info = muted("尚未选择资源目录。")
@@ -160,12 +167,23 @@ class DirectoryPage(WizardPage):
     # ------------------------------------------------------------------ hooks
 
     def on_enter(self) -> None:
+        # Snapshot first: every set_path() below publishes the whole form back
+        # into the config, so a field still empty at that moment would blank its
+        # own remembered value before we get to restore it.
+        config = self.window.config
+        remembered_content = config.content_root
+        remembered_output = config.output_root
+        remembered_project = config.unity_project
+
+        if remembered_project and not self.unity_project_picker.text():
+            self.unity_project_picker.set_path(remembered_project)
+        if remembered_content and not self.content_picker.text():
+            self.content_picker.set_path(remembered_content)
+        if remembered_output and not self.output_picker.text():
+            self.output_picker.set_path(remembered_output)
+
         if self.engine_combo.count() == 0:
             self._populate_engines()
-        if not self.content_picker.text() and self.window.config.content_root:
-            self.content_picker.set_path(self.window.config.content_root)
-        if not self.output_picker.text() and self.window.config.output_root:
-            self.output_picker.set_path(self.window.config.output_root)
         self._refresh_state()
 
     def on_leave(self) -> bool:
@@ -322,6 +340,12 @@ class DirectoryPage(WizardPage):
         config.output_root = output if output is not None else None
         if config.output_root is not None and remember:
             config.remember_output_root(config.output_root)
+
+        # Optional: only used by the import/package steps.
+        project = self.unity_project_picker.path()
+        config.unity_project = (
+            project if project is not None and (project / "Assets").is_dir() else None
+        )
 
         config.link_mode = self.mount_combo.currentData() or MountMode.JUNCTION.value
 
@@ -1025,6 +1049,28 @@ class RunPage(WizardPage):
         controls.addStretch(1)
         self.body.addLayout(controls)
 
+        # --- .unitypackage ---------------------------------------------------
+        package_row = QHBoxLayout()
+        self.package_button = QPushButton("导出 Unity 包（.unitypackage）")
+        self.package_button.setMinimumWidth(220)
+        self.package_button.setEnabled(False)
+        self.package_button.setToolTip(
+            "在 Unity 工程内导入本导出结果，并打包成一个 .unitypackage。"
+            "包内会带上 Avatar、动画循环标记、贴图类型等导入设置；"
+            "需要先在第 1 步选择 Unity 工程目录。"
+        )
+        self.package_button.clicked.connect(lambda: self.window.start_package())
+        package_row.addWidget(self.package_button)
+
+        self.editor_scripts_check = QCheckBox("包内包含 Editor 导入脚本")
+        self.editor_scripts_check.setChecked(True)
+        self.editor_scripts_check.setToolTip(
+            "取消勾选可避免目标工程已有同名 asmdef 时的 CS0101 重复定义。"
+        )
+        package_row.addWidget(self.editor_scripts_check)
+        package_row.addStretch(1)
+        self.body.addLayout(package_row)
+
         self.progress = ProgressPanel()
         self.body.addWidget(self.progress)
 
@@ -1053,6 +1099,7 @@ class RunPage(WizardPage):
     def refresh_plan(self) -> None:
         plan = self.window.ensure_plan()
         self.table.setRowCount(0)
+        self.package_button.setEnabled(self.window.export_root_is_ready())
         if plan is None:
             self.summary_label.setText("尚无转换计划，请先完成前面的步骤。")
             self.start_button.setEnabled(False)
@@ -1087,8 +1134,24 @@ class RunPage(WizardPage):
     def set_running(self, running: bool) -> None:
         self.start_button.setEnabled(not running)
         self.cancel_button.setEnabled(running)
+        self.package_button.setEnabled(
+            not running and self.window.export_root_is_ready()
+        )
         if running:
             self.retry_button.setEnabled(False)
+
+    def set_packaging(self, running: bool) -> None:
+        """While Unity is packaging, nothing else here should be clickable."""
+        self.package_button.setEnabled(not running)
+        self.editor_scripts_check.setEnabled(not running)
+        self.start_button.setEnabled(not running)
+        if running:
+            self.retry_button.setEnabled(False)
+            self.progress.set_fraction(None)
+            self.progress.set_caption("正在 Unity 工程内导入并打包…")
+        else:
+            report = self.window.report
+            self.retry_button.setEnabled(bool(report and report.retryable))
 
     def update_item(self, outcome: ExportOutcome) -> None:
         for row in range(self.table.rowCount()):

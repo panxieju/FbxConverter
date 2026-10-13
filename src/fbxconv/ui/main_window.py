@@ -8,6 +8,7 @@ from pathlib import Path
 
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -27,7 +28,7 @@ from ..report import ExportReport
 from ..unreal.locator import UnrealInstall, resolve_editor
 from .pages import DirectoryPage, RunPage, ScanPage, SelectPage, SettingsPage
 from .widgets import COLOR_MUTED, StepList, open_in_file_manager
-from .worker import ExportWorker, ScanWorker, make_plan
+from .worker import ExportWorker, PackageWorker, ScanWorker, make_plan
 
 _log = get_logger("ui")
 
@@ -58,6 +59,8 @@ class MainWindow(QMainWindow):
         self.report: ExportReport | None = None
         self._scan_worker: ScanWorker | None = None
         self._export_worker: ExportWorker | None = None
+        self._package_worker: PackageWorker | None = None
+        self._status_note: str | None = None
 
         self.setWindowTitle(f"{APP_DISPLAY_NAME} v{__version__}")
         self.resize(1180, 820)
@@ -174,6 +177,14 @@ class MainWindow(QMainWindow):
             return "请选择 Unity 输出目录。"
         if self.scan is None:
             return f"引擎：{self.install.label}    等待扫描。"
+        if self._status_note:
+            return (
+                f"引擎：{self.install.label}    "
+                f"资源 {len(self.scan.assets)} 个 / 转换组 {len(self.scan.groups)} 个 / "
+                f"静态网格 {self.scan.total_static_meshes} 个 / "
+                f"动画 {self.scan.total_animations} 个 / 贴图 {self.scan.total_textures} 个"
+                f"    {self._status_note}"
+            )
         return (
             f"引擎：{self.install.label}    "
             f"资源 {len(self.scan.assets)} 个 / 转换组 {len(self.scan.groups)} 个 / "
@@ -334,6 +345,86 @@ class MainWindow(QMainWindow):
             return
         open_in_file_manager(root)
 
+    # ------------------------------------------------------------ packaging
+
+    def resolve_unity_editor(self):
+        """The Unity-family editor to drive, or ``None`` when none is found."""
+        from ..unity.runner import find_unity_editors
+
+        installs = find_unity_editors()
+        preferred = self.config.unity_editor
+        if preferred is not None:
+            for install in installs:
+                if install.exe == Path(preferred):
+                    return install
+        return installs[0] if installs else None
+
+    def export_root_is_ready(self) -> bool:
+        root = self.export_root
+        return root is not None and (root / "manifest.json").is_file()
+
+    def start_package(self) -> None:
+        """Import the export inside Unity and write a ``.unitypackage``."""
+        if self._package_worker is not None and self._package_worker.isRunning():
+            self.warn("打包仍在进行中。")
+            return
+
+        if not self.export_root_is_ready():
+            self.warn("请先完成一次转换：打包需要 UnityExport/manifest.json。")
+            return
+
+        project = self.config.unity_project
+        if project is None or not Path(project).is_dir():
+            self.warn(
+                "请在第 1 步选择 Unity 工程目录：打包必须在 Unity 项目内进行，"
+                "因为只有编辑器才能写出携带导入设置的 .unitypackage。"
+            )
+            return
+
+        editor = self.resolve_unity_editor()
+        if editor is None:
+            self.warn("未找到 Unity/团结引擎 编辑器。")
+            return
+
+        # Unity would try to import a .unitypackage placed under Assets/, so the
+        # default suggestion deliberately sits next to the project instead.
+        suggested = Path(project) / "Artifacts" / "UnityExport.unitypackage"
+        chosen, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存 Unity package",
+            str(suggested),
+            "Unity package (*.unitypackage)",
+        )
+        if not chosen:
+            return
+
+        worker = PackageWorker(
+            editor,
+            Path(project),
+            self.export_root,
+            Path(chosen),
+            include_editor_scripts=self.run_page.editor_scripts_check.isChecked(),
+        )
+        worker.progress.connect(self._on_progress)
+        worker.event.connect(self._on_event)
+        worker.finished_ok.connect(self._on_package_finished)
+        worker.failed.connect(self._on_worker_failed)
+        self._package_worker = worker
+
+        self.go_to(self.pages.index(self.run_page))
+        self.run_page.set_packaging(True)
+        _log.info("开始打包 Unity package：%s", chosen)
+        worker.start()
+
+    def _on_package_finished(self, path: str) -> None:
+        self.run_page.set_packaging(False)
+        size = Path(path).stat().st_size if Path(path).is_file() else 0
+        self.run_page.append_log(
+            logging.INFO, f"已生成 Unity package：{path}（{size / 1048576:.1f} MB）"
+        )
+        self._status_note = f"Unity 包：{Path(path).name}（{size / 1048576:.1f} MB）"
+        self.refresh_navigation()
+
     # -------------------------------------------------------------- callbacks
 
     def _on_progress(self, message: str, fraction) -> None:
@@ -377,7 +468,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------- lifecycle
 
     def closeEvent(self, event) -> None:
-        for worker in (self._scan_worker, self._export_worker):
+        for worker in (self._scan_worker, self._export_worker, self._package_worker):
             if worker is not None and worker.isRunning():
                 worker.cancel()
                 worker.wait(5000)

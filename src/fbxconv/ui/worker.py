@@ -149,4 +149,61 @@ def make_plan(
     )
 
 
-__all__ = ["ExportWorker", "ScanWorker", "make_plan"]
+class PackageWorker(_CancellableThread):
+    """Imports the export inside Unity and writes a ``.unitypackage``.
+
+    Animation is applied by the C# importer, so this has to run in the editor;
+    ``run_batch_package`` only returns when the editor process exits.
+    """
+
+    finished_ok = pyqtSignal(str)  # package path
+
+    def __init__(
+        self,
+        install,
+        project: Path,
+        export_root: Path,
+        package_path: Path,
+        *,
+        include_editor_scripts: bool = True,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._install = install
+        self._project = Path(project)
+        self._export_root = Path(export_root)
+        self._package_path = Path(package_path)
+        self._include_editor_scripts = include_editor_scripts
+
+    def run(self) -> None:
+        from ..unity.runner import run_batch_package
+
+        try:
+            result = run_batch_package(
+                self._install,
+                self._project,
+                self._export_root,
+                self._package_path,
+                include_editor_scripts=self._include_editor_scripts,
+                on_output=lambda line: self.progress.emit(line, None),
+            )
+        except BaseException as exc:
+            self._report_error(exc)
+            return
+
+        if not result.ok:
+            self.failed.emit(
+                f"Unity 打包失败（退出码 {result.returncode}）。日志：{result.log_path}",
+                result.output_tail,
+            )
+            return
+        if not self._package_path.is_file():
+            self.failed.emit(
+                f"Unity 退出码为 0，但没有生成 {self._package_path.name}。",
+                result.output_tail,
+            )
+            return
+        self.finished_ok.emit(str(self._package_path))
+
+
+__all__ = ["ExportWorker", "PackageWorker", "ScanWorker", "make_plan"]

@@ -830,7 +830,7 @@ FbxConverter/
     ue_scripts/                → 在 Unreal 内执行
       fbxconv_common.py  fbxconv_scan.py  fbxconv_export.py  fbxconv_textures.py
     ui/{app,main_window,pages,widgets,worker,__init__}.py
-  tests/                       217 个单元测试
+  tests/                       231 个单元测试
     test_discover.py           目录解析、.uproject 查找、伴随文件
     test_paths.py              包路径换算、文件名净化与去重
     test_models.py             资源分类、骨架分组、同名消歧、空组过滤
@@ -841,7 +841,8 @@ FbxConverter/
     test_diagnostics.py        挂载点不匹配诊断
     test_unity_install.py      Editor 脚本投放与 Test Framework 门控
     test_ui_logging.py         GUI 日志链路（曾在真实运行时崩过）
-    test_ui_flow.py            向导状态发布、扫描按钮、选择页勾选清单、\n                               设置/运行页（曾在真实运行时崩过两次）
+    test_ui_flow.py            向导状态发布、扫描按钮、选择页勾选清单、
+                               打包按钮与 Unity 工程字段、\n                               设置/运行页（曾在真实运行时崩过两次）
 ```
 
 ---

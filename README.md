@@ -100,7 +100,11 @@ python -m fbxconv convert H:\Proj\Content --out G:\Out --all `
 
 ### `.unitypackage` 说明
 
-`unity-package` 会先在目标工程里**导入**一次，再用
+图形界面同样支持：第 1 步填 **Unity 工程目录**，第 5 步转换完成后点
+**「导出 Unity 包（.unitypackage）」**，选个保存位置即可（旁边的复选框控制包内
+是否含 Editor 脚本）。
+
+命令行 `unity-package` 会先在目标工程里**导入**一次，再用
 `AssetDatabase.ExportPackage` 写出包。这一步必须在编辑器内做，也正是它的价值：
 
 - 包里带的是**已经配好的导入设置**——Avatar、每个动画的循环标记、贴图类型与

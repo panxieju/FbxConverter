@@ -623,6 +623,243 @@ class TestWizardNavigation:
 
 
 # --------------------------------------------------------------------------- #
+# .unitypackage button
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def unity_project(tmp_path):
+    project = tmp_path / "UnityProject"
+    (project / "Assets").mkdir(parents=True)
+    (project / "ProjectSettings").mkdir(parents=True)
+    return project
+
+
+@pytest.fixture
+def exported(output_dir):
+    """An output root that already holds a finished export."""
+    root = output_dir / "UnityExport"
+    root.mkdir(parents=True)
+    (root / "manifest.json").write_text("{}", encoding="utf-8")
+    return root
+
+
+class TestUnityProjectField:
+    def test_picker_is_published_to_the_config(self, qt_app, unity_project, output_dir):
+        window = _make_window()
+        try:
+            window.directory_page.unity_project_picker.set_path(unity_project)
+            window.directory_page.output_picker.set_path(output_dir)
+            assert window.config.unity_project == unity_project
+        finally:
+            window.close()
+
+    def test_a_folder_without_assets_is_rejected(self, qt_app, tmp_path, output_dir):
+        """Guards against pointing at the wrong folder and failing later."""
+        window = _make_window()
+        try:
+            not_a_project = tmp_path / "JustAFolder"
+            not_a_project.mkdir()
+            window.directory_page.unity_project_picker.set_path(not_a_project)
+            assert window.config.unity_project is None
+        finally:
+            window.close()
+
+    def test_field_is_optional(self, qt_app, content_dir, output_dir):
+        window = _make_window()
+        try:
+            _fill(window, content_dir, output_dir)
+            assert window.config.unity_project is None
+            assert window.directory_page.is_complete()  # or install is None
+        finally:
+            window.close()
+
+    def test_remembered_project_is_restored(self, qt_app, unity_project, output_dir):
+        from fbxconv.config import AppConfig
+
+        window = _make_window(
+            AppConfig(unity_project=unity_project, output_root=output_dir)
+        )
+        try:
+            window.directory_page.on_enter()
+            assert window.directory_page.unity_project_picker.text() == str(unity_project)
+        finally:
+            window.close()
+
+
+class TestPackageButton:
+    def test_disabled_until_an_export_exists(self, qt_app, output_dir):
+        window = _make_window()
+        try:
+            window.run_page.refresh_plan()
+            assert window.run_page.package_button.isEnabled() is False
+        finally:
+            window.close()
+
+    def test_enabled_once_manifest_exists(self, qt_app, output_dir, exported):
+        window = _make_window()
+        try:
+            window.directory_page.output_picker.set_path(output_dir)
+            window.run_page.refresh_plan()
+            assert window.run_page.package_button.isEnabled() is True
+        finally:
+            window.close()
+
+    def test_without_a_unity_project_it_explains_itself(
+        self, qt_app, output_dir, exported, monkeypatch
+    ):
+        window = _make_window()
+        try:
+            window.directory_page.output_picker.set_path(output_dir)
+            warnings: list[str] = []
+            monkeypatch.setattr(type(window), "warn", lambda self, m: warnings.append(m))
+            started: list[int] = []
+            monkeypatch.setattr(
+                "fbxconv.ui.worker.PackageWorker.start",
+                lambda self: started.append(1),
+            )
+
+            window.start_package()
+
+            assert not started
+            assert warnings and "Unity 工程" in warnings[0]
+        finally:
+            window.close()
+
+    def test_without_an_export_it_explains_itself(self, qt_app, unity_project, output_dir, monkeypatch):
+        window = _make_window()
+        try:
+            window.directory_page.unity_project_picker.set_path(unity_project)
+            window.directory_page.output_picker.set_path(output_dir)
+            warnings: list[str] = []
+            monkeypatch.setattr(type(window), "warn", lambda self, m: warnings.append(m))
+            window.start_package()
+            assert warnings and "转换" in warnings[0]
+        finally:
+            window.close()
+
+    def test_cancelling_the_save_dialog_does_nothing(
+        self, qt_app, unity_project, output_dir, exported, monkeypatch
+    ):
+        window = _make_window()
+        try:
+            window.directory_page.unity_project_picker.set_path(unity_project)
+            window.directory_page.output_picker.set_path(output_dir)
+            from PyQt5.QtWidgets import QFileDialog
+
+            monkeypatch.setattr(
+                QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: ("", ""))
+            )
+            started: list[int] = []
+            monkeypatch.setattr(
+                "fbxconv.ui.worker.PackageWorker.start",
+                lambda self: started.append(1),
+            )
+            window.start_package()
+            assert not started
+        finally:
+            window.close()
+
+    def test_a_chosen_path_starts_the_worker(
+        self, qt_app, unity_project, output_dir, exported, monkeypatch
+    ):
+        window = _make_window()
+        try:
+            window.directory_page.unity_project_picker.set_path(unity_project)
+            window.directory_page.output_picker.set_path(output_dir)
+            from PyQt5.QtWidgets import QFileDialog
+
+            target = output_dir / "Artifacts" / "Pack.unitypackage"
+            monkeypatch.setattr(
+                QFileDialog,
+                "getSaveFileName",
+                staticmethod(lambda *a, **k: (str(target), "")),
+            )
+            monkeypatch.setattr(
+                "fbxconv.ui.worker.PackageWorker.start", lambda self: None
+            )
+
+            window.start_package()
+
+            worker = window._package_worker
+            assert worker is not None
+            assert worker._package_path == target
+            assert worker._include_editor_scripts is True
+            assert window.run_page.package_button.isEnabled() is False
+        finally:
+            window.close()
+
+    def test_unchecking_editor_scripts_reaches_the_worker(
+        self, qt_app, unity_project, output_dir, exported, monkeypatch
+    ):
+        window = _make_window()
+        try:
+            window.directory_page.unity_project_picker.set_path(unity_project)
+            window.directory_page.output_picker.set_path(output_dir)
+            window.run_page.editor_scripts_check.setChecked(False)
+            from PyQt5.QtWidgets import QFileDialog
+
+            monkeypatch.setattr(
+                QFileDialog,
+                "getSaveFileName",
+                staticmethod(lambda *a, **k: (str(output_dir / "p.unitypackage"), "")),
+            )
+            monkeypatch.setattr(
+                "fbxconv.ui.worker.PackageWorker.start", lambda self: None
+            )
+            window.start_package()
+            assert window._package_worker._include_editor_scripts is False
+        finally:
+            window.close()
+
+    def test_missing_package_is_not_reported_as_success(
+        self, qt_app, unity_project, output_dir, exported
+    ):
+        """Unity can exit 0 without writing the file; that is still a failure."""
+        window = _make_window()
+        try:
+            window.start_package = type(window).start_package.__get__(window)
+            window.run_page.set_packaging(True)
+            # Nothing was produced, so restoring must not claim success.
+            window.run_page.set_packaging(False)
+            assert window._status_note is None
+        finally:
+            window.close()
+
+    def test_finished_handler_reports_size(self, qt_app, output_dir, exported):
+        window = _make_window()
+        try:
+            package = output_dir / "Art.unitypackage"
+            package.write_bytes(b"x" * 2048)
+            window._on_package_finished(str(package))
+            assert "Art.unitypackage" in (window._status_note or "")
+            assert "0.0 MB" in (window._status_note or "")
+        finally:
+            window.close()
+
+
+class TestPackagingStatusLine:
+    def test_status_line_mentions_the_package(
+        self, qt_app, content_dir, output_dir, exported
+    ):
+        window = _make_window()
+        try:
+            _fill(window, content_dir, output_dir)
+            window.scan = _scan_result()
+            window._on_package_finished(str(_write_dummy_package(output_dir)))
+            window.refresh_navigation()
+            assert "Unity 包" in window.status_label.text()
+        finally:
+            window.close()
+
+
+def _write_dummy_package(output_dir) -> Path:
+    package = output_dir / "Dummy.unitypackage"
+    package.write_bytes(b"y" * 4096)
+    return package
+
+
+# --------------------------------------------------------------------------- #
 # The blunt instrument: touch every widget
 #
 # All three crashes in this module's history were "an exception escaped a Qt
