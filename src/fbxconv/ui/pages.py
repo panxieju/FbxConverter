@@ -655,7 +655,7 @@ class SelectPage(WizardPage):
             for mesh in group.meshes:
                 entry = QListWidgetItem(mesh.name)
                 entry.setFlags(entry.flags() | Qt.ItemIsUserCheckable)
-                entry.setCheckState(0, Qt.Checked)
+                entry.setCheckState(Qt.Checked)
                 entry.setData(Qt.UserRole, mesh.package_path)
                 if mesh.textures:
                     entry.setToolTip(f"引用 {len(mesh.textures)} 个贴图")
@@ -671,7 +671,7 @@ class SelectPage(WizardPage):
                     label += "   [循环]"
                 entry = QListWidgetItem(label)
                 entry.setFlags(entry.flags() | Qt.ItemIsUserCheckable)
-                entry.setCheckState(0, Qt.Checked)
+                entry.setCheckState(Qt.Checked)
                 entry.setData(Qt.UserRole, animation.package_path)
                 self.animation_list.addItem(entry)
         self.animation_list.blockSignals(False)
@@ -695,7 +695,7 @@ class SelectPage(WizardPage):
         for row in range(self.animation_list.count()):
             item = self.animation_list.item(row)
             if not item.isHidden():
-                item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
         self.animation_list.blockSignals(False)
         self._update_summary()
 
@@ -718,7 +718,7 @@ class SelectPage(WizardPage):
             item = self.animation_list.item(row)
             package = item.data(Qt.UserRole) or ""
             name = package.rsplit("/", 1)[-1]
-            item.setCheckState(0, Qt.Checked if infer_loop(name) else Qt.Unchecked)
+            item.setCheckState(Qt.Checked if infer_loop(name) else Qt.Unchecked)
         self.animation_list.blockSignals(False)
         self._update_summary()
 
@@ -745,14 +745,14 @@ class SelectPage(WizardPage):
             count = sum(
                 1
                 for row in range(self.animation_list.count())
-                if self.animation_list.item(row).checkState(0) == Qt.Checked
+                if self.animation_list.item(row).checkState() == Qt.Checked
             )
             detail = f"当前组勾选 {count} 个网格。"
         else:
             animations = sum(
                 1
                 for row in range(self.animation_list.count())
-                if self.animation_list.item(row).checkState(0) == Qt.Checked
+                if self.animation_list.item(row).checkState() == Qt.Checked
             )
             detail = f"当前组勾选 {animations} 个动画。"
 
@@ -777,7 +777,7 @@ class SelectPage(WizardPage):
         return sum(
             1
             for row in range(self.animation_list.count())
-            if self.animation_list.item(row).checkState(0) == Qt.Checked
+            if self.animation_list.item(row).checkState() == Qt.Checked
         )
 
     def build_selection(self) -> list[SelectedGroup]:
@@ -801,7 +801,7 @@ class SelectPage(WizardPage):
                     packages = {
                         self.animation_list.item(row).data(Qt.UserRole)
                         for row in range(self.animation_list.count())
-                        if self.animation_list.item(row).checkState(0) == Qt.Checked
+                        if self.animation_list.item(row).checkState() == Qt.Checked
                     }
                     meshes = [m for m in group.meshes if m.package_path in packages]
                 selection.append(SelectedGroup(group=group, meshes=meshes))
@@ -813,7 +813,7 @@ class SelectPage(WizardPage):
                 packages = {
                     self.animation_list.item(row).data(Qt.UserRole)
                     for row in range(self.animation_list.count())
-                    if self.animation_list.item(row).checkState(0) == Qt.Checked
+                    if self.animation_list.item(row).checkState() == Qt.Checked
                 }
                 chosen_animations = [
                     a for a in group.animations if a.package_path in packages

@@ -682,7 +682,36 @@ def _start_scan(self):
    现在一起走 `_sync_and_refresh()`。
 
 教训写成规则：**任何按钮都不许“什么都不做”**。要么干活，要么说清楚为什么不能干。
-`tests/test_ui_flow.py` 现在钉住这条链路（含“过期 config 必须被界面覆盖”这一条）。
+
+### 6.20 `QListWidgetItem` 与 `QTreeWidgetItem` 的勾选接口不是同一个形状
+
+修好上一个问题后，用户点进第 3 步立刻以 `0xC0000409` 崩溃：
+
+```
+File ".../ui/pages.py", line 674, in _load_group
+    entry.setCheckState(0, Qt.Checked)
+TypeError: setCheckState(self, state: Qt.CheckState): too many arguments
+```
+
+两者签名不同：
+
+| 类型 | 写 | 读 |
+|---|---|---|
+| `QTreeWidgetItem` | `setCheckState(column, state)` | `checkState(column)` |
+| `QListWidgetItem` | `setCheckState(state)` | `checkState()` |
+
+选择页把**树**的签名用在了**列表**上（动画清单与静态网格清单各一处 `set`，
+另有 5 处 `checkState(0)` 读取）。这不是静态网格功能引入的：
+动画清单从一开始就是错的，只是此前没有人走到过第 3 步。
+
+失败方式与 §6.13 完全一致——`TypeError` 从 Qt 槽函数逃逸 → `qFatal` →
+进程以 `0xC0000409` 结束。**PyQt 槽函数里的 API 误用不会只打印堆栈，它会杀掉进程。**
+
+之所以漏掉，是因为最初只覆盖了第 1、2 步。现在 `tests/test_ui_flow.py` 用
+**真实的 `Rapier_AnimSet` 扫描结果**（167 资源 / 2 组）驱动整条向导：
+逐组打开、全选/全不选/仅循环、过滤、`build_selection`、设置页预览、
+`ensure_plan`、运行页表格与条目更新。这类“把每个控件都摸一遍”的测试是这里唯一
+有效的防线——静态检查看不出 `Qt` 重载签名，只有真的把控件建出来才会报错。
 
 ---
 
@@ -711,7 +740,7 @@ FbxConverter/
     ue_scripts/                → 在 Unreal 内执行
       fbxconv_common.py  fbxconv_scan.py  fbxconv_export.py  fbxconv_textures.py
     ui/{app,main_window,pages,widgets,worker,__init__}.py
-  tests/                       164 个单元测试
+  tests/                       186 个单元测试
     test_discover.py           目录解析、.uproject 查找、伴随文件
     test_paths.py              包路径换算、文件名净化与去重
     test_models.py             资源分类、骨架分组、同名消歧、空组过滤
@@ -722,7 +751,7 @@ FbxConverter/
     test_diagnostics.py        挂载点不匹配诊断
     test_unity_install.py      Editor 脚本投放与 Test Framework 门控
     test_ui_logging.py         GUI 日志链路（曾在真实运行时崩过）
-    test_ui_flow.py            向导状态发布与扫描按钮（曾经静默无反应）
+    test_ui_flow.py            向导状态发布、扫描按钮、选择页勾选清单、\n                               设置/运行页（曾在真实运行时崩过两次）
 ```
 
 ---

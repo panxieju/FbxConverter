@@ -1,14 +1,22 @@
 """GUI flow regression tests.
 
-This module exists because the wizard's scan button was a **silent no-op** on a
-fresh config: ``ScanPage._start_scan`` bailed out when ``config.content_root``
-was ``None``, but that field is only filled by ``DirectoryPage.apply_to_config()``
--- which ran *inside* ``MainWindow.start_scan()``, i.e. after the guard. Nothing
-on the page-1 -> page-2 transition pushed the pickers into the config, so a
-correctly filled-in form produced a button that did nothing at all.
+Two real defects drove this module, both of which killed the process rather than
+showing an error:
 
-Worse, when ``AppConfig`` *did* carry a remembered path, the GUI silently scanned
-that stale directory instead of what was on screen.
+1. The wizard's scan button was a **silent no-op** on a fresh config.
+   ``ScanPage._start_scan`` bailed out when ``config.content_root`` was ``None``,
+   but that field is only filled by ``DirectoryPage.apply_to_config()`` -- which
+   ran *inside* ``MainWindow.start_scan()``, i.e. after the guard. Nothing on the
+   page-1 -> page-2 transition pushed the pickers into the config, so a correctly
+   filled-in form produced a button that did nothing. When ``AppConfig`` did
+   carry a remembered path, the GUI silently scanned that stale directory
+   instead, which is worse.
+
+2. The selection page used ``QTreeWidgetItem``'s two-argument
+   ``setCheckState(column, state)`` on ``QListWidgetItem``, whose signature takes
+   no column. That ``TypeError`` escaped a Qt slot, so Qt went to ``qFatal`` and
+   the process died with ``0xC0000409`` -- the same failure mode as the original
+   ``setTextColor`` bug (see project.md 6.13).
 
 Runs against Qt's ``offscreen`` platform plugin; skipped when PyQt5 is absent.
 """
@@ -16,6 +24,7 @@ Runs against Qt's ``offscreen`` platform plugin; skipped when PyQt5 is absent.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -61,6 +70,94 @@ def _fill(window, content, output):
     window.directory_page.output_picker.set_path(output)
 
 
+# --------------------------------------------------------------------------- #
+# A scan result with both kinds of group
+# --------------------------------------------------------------------------- #
+
+
+def _skeletal_group_assets() -> list:
+    from fbxconv.models import AssetKind, AssetRecord
+
+    skeleton = "/Game/Pack/Animation/Skeleton/UE4_Mannequin_Skeleton"
+    assets = [
+        AssetRecord(skeleton, "UE4_Mannequin_Skeleton", "Skeleton", AssetKind.SKELETON),
+        AssetRecord(
+            "/Game/Pack/mesh/SK_Mannequin",
+            "SK_Mannequin",
+            "SkeletalMesh",
+            AssetKind.SKELETAL_MESH,
+            skeleton=skeleton,
+        ),
+    ]
+    for name in ("attack_01", "attack_02", "idle_wait", "jump_start"):
+        assets.append(
+            AssetRecord(
+                f"/Game/Pack/Animation/{name}",
+                name,
+                "AnimSequence",
+                AssetKind.ANIM_SEQUENCE,
+                skeleton=skeleton,
+                num_frames=30,
+                duration=1.0,
+            )
+        )
+    return assets
+
+
+def _static_group_assets() -> list:
+    from fbxconv.models import AssetKind, AssetRecord
+
+    out = []
+    for name, triangles in (("SM_Rock", 120), ("SM_Tree", 340), ("SM_Bush", 12)):
+        record = AssetRecord(
+            f"/Game/Pack/Env/{name}",
+            name,
+            "StaticMesh",
+            AssetKind.STATIC_MESH,
+            materials=["/Game/Pack/Env/M_Env"],
+        )
+        record.textures = ["/Game/Pack/Env/T_Env"]
+        record.extra["material_slots"] = [
+            {
+                "slot": "Env",
+                "material": "/Game/Pack/Env/M_Env",
+                "textures": ["/Game/Pack/Env/T_Env"],
+            }
+        ]
+        record.extra["triangle_count"] = triangles
+        out.append(record)
+    return out
+
+
+def _scan_result(*, skeletal: bool = True, static: bool = True):
+    from fbxconv.models import ScanResult
+    from fbxconv.pipeline.scan import group_assets
+
+    assets: list = []
+    if skeletal:
+        assets.extend(_skeletal_group_assets())
+    if static:
+        assets.extend(_static_group_assets())
+    groups = group_assets(assets, mount_point="/Game", scope_prefix="/Game/Pack")
+    return ScanResult(
+        content_root=Path("/tmp/Content"),
+        mount_point="/Game",
+        project_file=None,
+        conversion_project=None,
+        engine_version="5.4.4",
+        scope_prefix="/Game/Pack",
+        groups=groups,
+        assets=assets,
+    )
+
+
+def _window_with_scan(scan):
+    window = _make_window()
+    window.scan = scan
+    window.select_page.on_enter()
+    return window
+
+
 class TestDirectoryStateIsPushedToConfig:
     def test_typed_paths_reach_the_config(self, qt_app, content_dir, output_dir):
         window = _make_window()
@@ -88,9 +185,7 @@ class TestDirectoryStateIsPushedToConfig:
         finally:
             window.close()
 
-    def test_leaving_page_one_pushes_the_state(
-        self, qt_app, content_dir, output_dir
-    ):
+    def test_leaving_page_one_pushes_the_state(self, qt_app, content_dir, output_dir):
         window = _make_window()
         try:
             _fill(window, content_dir, output_dir)
@@ -116,7 +211,9 @@ class TestDirectoryStateIsPushedToConfig:
 
 
 class TestScanButton:
-    def test_scan_starts_with_a_fresh_config(self, qt_app, content_dir, output_dir, monkeypatch):
+    def test_scan_starts_with_a_fresh_config(
+        self, qt_app, content_dir, output_dir, monkeypatch
+    ):
         """The reported bug: button clicked, nothing happened."""
         window = _make_window()
         try:
@@ -210,3 +307,317 @@ class TestScanPageDoor:
                 assert window.directory_page.is_complete() is True
         finally:
             window.close()
+
+
+# --------------------------------------------------------------------------- #
+# Selection page: the checklist widgets
+# --------------------------------------------------------------------------- #
+
+
+def _select_group(window, index: int) -> None:
+    window.select_page.group_list.setCurrentItem(
+        window.select_page.group_list.topLevelItem(index)
+    )
+
+
+def _static_index(scan) -> int:
+    return next(i for i, g in enumerate(scan.groups) if g.is_static)
+
+
+def _skeletal_index(scan) -> int:
+    return next(i for i, g in enumerate(scan.groups) if not g.is_static)
+
+
+def _list_check_states(window) -> list[bool]:
+    from PyQt5.QtCore import Qt
+
+    widget = window.select_page.animation_list
+    return [
+        widget.item(row).checkState() == Qt.Checked for row in range(widget.count())
+    ]
+
+
+class TestSelectionPageLoadsGroups:
+    """``_load_group`` used to raise TypeError and take the process with it."""
+
+    def test_populating_does_not_raise(self, qt_app):
+        window = _window_with_scan(_scan_result())
+        try:
+            assert window.select_page.group_list.topLevelItemCount() == 2
+        finally:
+            window.close()
+
+    def test_every_group_can_be_opened(self, qt_app):
+        scan = _scan_result()
+        window = _window_with_scan(scan)
+        try:
+            for index in range(len(scan.groups)):
+                _select_group(window, index)
+        finally:
+            window.close()
+
+    def test_skeletal_group_lists_its_animations(self, qt_app):
+        scan = _scan_result()
+        window = _window_with_scan(scan)
+        try:
+            _select_group(window, _skeletal_index(scan))
+            assert window.select_page.animation_list.count() == 4
+            assert all(_list_check_states(window))
+        finally:
+            window.close()
+
+    def test_static_group_lists_its_meshes(self, qt_app):
+        scan = _scan_result()
+        window = _window_with_scan(scan)
+        try:
+            _select_group(window, _static_index(scan))
+            assert window.select_page.animation_list.count() == 3
+            assert all(_list_check_states(window))
+        finally:
+            window.close()
+
+    def test_toggle_all_and_looping_do_not_raise(self, qt_app):
+        scan = _scan_result()
+        window = _window_with_scan(scan)
+        try:
+            for index in range(len(scan.groups)):
+                _select_group(window, index)
+                window.select_page._set_all(False)
+                assert not any(_list_check_states(window))
+                window.select_page._set_all(True)
+                assert all(_list_check_states(window))
+                window.select_page._select_looping()
+        finally:
+            window.close()
+
+    def test_filter_does_not_raise(self, qt_app):
+        window = _window_with_scan(_scan_result())
+        try:
+            window.select_page.filter_edit.setText("attack")
+            window.select_page.filter_edit.setText("")
+        finally:
+            window.close()
+
+
+class TestSelectionPageBuildsSelection:
+    def test_static_group_selects_every_mesh(self, qt_app):
+        scan = _scan_result()
+        window = _window_with_scan(scan)
+        try:
+            selection = window.select_page.build_selection()
+            static = next(s for s in selection if s.group.is_static)
+            assert len(static.selected_meshes) == 3
+            assert len(selection) == 2
+        finally:
+            window.close()
+
+    def test_unchecking_a_mesh_is_honoured(self, qt_app):
+        from PyQt5.QtCore import Qt
+
+        scan = _scan_result()
+        window = _window_with_scan(scan)
+        try:
+            _select_group(window, _static_index(scan))
+            window.select_page.animation_list.item(0).setCheckState(Qt.Unchecked)
+            selection = window.select_page.build_selection()
+            static = next(s for s in selection if s.group.is_static)
+            assert len(static.selected_meshes) == 2
+        finally:
+            window.close()
+
+    def test_skeletal_group_reports_checked_animations(self, qt_app):
+        from PyQt5.QtCore import Qt
+
+        scan = _scan_result()
+        window = _window_with_scan(scan)
+        try:
+            _select_group(window, _skeletal_index(scan))
+            window.select_page.animation_list.item(0).setCheckState(Qt.Unchecked)
+            selection = window.select_page.build_selection()
+            skeletal = next(s for s in selection if not s.group.is_static)
+            assert len(skeletal.animations) == 3
+            assert skeletal.reference_mesh is not None
+        finally:
+            window.close()
+
+    def test_unchecking_a_group_drops_it(self, qt_app):
+        from PyQt5.QtCore import Qt
+
+        scan = _scan_result()
+        window = _window_with_scan(scan)
+        try:
+            item = window.select_page.group_list.topLevelItem(0)
+            item.setCheckState(0, Qt.Unchecked)
+            assert len(window.select_page.build_selection()) == 1
+        finally:
+            window.close()
+
+
+class TestSelectionPageSummaries:
+    def test_summary_mentions_both_kinds(self, qt_app):
+        scan = _scan_result()
+        window = _window_with_scan(scan)
+        try:
+            text = window.select_page.summary.text()
+            assert "转换组" in text
+            assert "静态网格" in text
+        finally:
+            window.close()
+
+    def test_skeletal_only_scan_is_handled(self, qt_app):
+        scan = _scan_result(static=False)
+        window = _window_with_scan(scan)
+        try:
+            assert len(window.select_page.build_selection()) == 1
+        finally:
+            window.close()
+
+    def test_static_only_scan_is_handled(self, qt_app):
+        scan = _scan_result(skeletal=False)
+        window = _window_with_scan(scan)
+        try:
+            selection = window.select_page.build_selection()
+            assert len(selection) == 1
+            assert selection[0].group.is_static
+        finally:
+            window.close()
+
+
+# --------------------------------------------------------------------------- #
+# Settings and run pages: the paths that were never driven from the UI
+# --------------------------------------------------------------------------- #
+
+
+def _plan_ready_window(scan, output_dir):
+    """A window whose config is complete enough for ``build_plan`` to run."""
+    window = _make_window()
+    window.directory_page.output_picker.set_path(output_dir)
+    window.scan = scan
+    window.plan = None
+    window.select_page.on_enter()
+    return window
+
+
+class TestSettingsPage:
+    def test_preview_renders_both_layouts(self, qt_app):
+        scan = _scan_result()
+        window = _window_with_scan(scan)
+        try:
+            window.settings_page.on_enter()
+            text = window.settings_page.preview.toPlainText()
+            assert "Characters/" in text
+            assert "StaticMeshes/" in text
+            assert "_Textures/" in text
+        finally:
+            window.close()
+
+    def test_preview_hides_textures_when_disabled(self, qt_app):
+        scan = _scan_result()
+        window = _window_with_scan(scan)
+        try:
+            window.settings_page.textures_check.setChecked(False)
+            window.settings_page.on_enter()
+            assert "_Textures/" not in window.settings_page.preview.toPlainText()
+        finally:
+            window.close()
+
+    def test_collect_carries_the_texture_flag(self, qt_app):
+        window = _make_window()
+        try:
+            assert window.settings_page.collect().export_textures is True
+            window.settings_page.textures_check.setChecked(False)
+            settings = window.settings_page.collect()
+            assert settings.export_textures is False
+            assert settings.to_payload()["export_textures"] is False
+        finally:
+            window.close()
+
+
+class TestRunPage:
+    def test_plan_preview_lists_meshes_animations_and_textures(
+        self, qt_app, output_dir
+    ):
+        scan = _scan_result()
+        window = _plan_ready_window(scan, output_dir)
+        try:
+            assert window.ensure_plan() is not None
+            window.run_page.refresh_plan()
+
+            table = window.run_page.table
+            kinds = [table.item(row, 1).text() for row in range(table.rowCount())]
+            assert "Static Mesh" in kinds
+            assert "Animation Sequence" in kinds
+            assert "贴图" in kinds
+            assert table.rowCount() == len(window.plan.all_requests) + len(
+                window.plan.texture_requests
+            )
+        finally:
+            window.close()
+
+    def test_summary_counts_static_groups(self, qt_app, output_dir):
+        scan = _scan_result()
+        window = _plan_ready_window(scan, output_dir)
+        try:
+            window.ensure_plan()
+            window.run_page.refresh_plan()
+            text = window.run_page.summary_label.text()
+            assert "静态组" in text
+            assert "贴图" in text
+        finally:
+            window.close()
+
+    def test_item_updates_do_not_raise(self, qt_app, output_dir):
+        from fbxconv.models import ExportOutcome, ExportRequest, ItemStatus
+
+        scan = _scan_result()
+        window = _plan_ready_window(scan, output_dir)
+        try:
+            window.ensure_plan()
+            window.run_page.refresh_plan()
+
+            record = scan.static_groups[0].meshes[0]
+            request = ExportRequest(
+                kind=record.kind,
+                package_path=record.package_path,
+                output_rel="StaticMeshes/Env/SM_Rock.fbx",
+            )
+            for status in ItemStatus:
+                window.run_page.update_item(
+                    ExportOutcome(request=request, status=status, detail="detail")
+                )
+        finally:
+            window.close()
+
+    def test_show_report_does_not_raise(self, qt_app):
+        from fbxconv.report import ExportReport
+
+        window = _make_window()
+        try:
+            window.run_page.show_report(ExportReport())
+        finally:
+            window.close()
+
+    def test_retry_without_a_report_is_a_no_op(self, qt_app):
+        window = _make_window()
+        try:
+            window.report = None
+            window.retry_failed()
+        finally:
+            window.close()
+
+
+class TestWizardNavigation:
+    def test_walking_forward_and_back_does_not_raise(
+        self, qt_app, content_dir, output_dir
+    ):
+        window = _make_window()
+        try:
+            _fill(window, content_dir, output_dir)
+            window.scan = _scan_result()
+            for index in range(len(window.pages)):
+                window.go_to(index)
+            for index in range(len(window.pages) - 1, -1, -1):
+                window.go_to(index)
+        finally:
+            window.close()
+
