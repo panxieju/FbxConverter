@@ -38,7 +38,7 @@ from .models import (
 )
 from .pipeline.export import ExportSession, build_plan
 from .pipeline.scan import ScanSession, group_output_name
-from .unity.runner import find_unity_editors, run_batch_import
+from .unity.runner import find_unity_editors, run_batch_import, run_batch_package
 from .unreal.locator import UnrealInstall, find_default_install, find_installs, resolve_editor
 from .unreal.project import MountMode
 
@@ -371,6 +371,11 @@ def cmd_convert(args: argparse.Namespace) -> int:
         if report.retryable:
             print(f"  可用相同命令重试 {len(report.retryable)} 个失败项")
 
+    if getattr(args, "unity_package", None):
+        return _do_unity_package(
+            args, Path(args.out) / "UnityExport", report.failure_count
+        )
+
     if args.unity_import:
         return _do_unity_import(args, Path(args.out) / "UnityExport", report.failure_count)
 
@@ -381,26 +386,33 @@ def cmd_unity_import(args: argparse.Namespace) -> int:
     return _do_unity_import(args, Path(args.export_root), 0)
 
 
+def cmd_unity_package(args: argparse.Namespace) -> int:
+    return _do_unity_package(args, Path(args.export_root), 0)
+
+
+def _resolve_unity_editor(args: argparse.Namespace):
+    """The editor to drive, honouring --unity, else the first installed one."""
+    from .unity.runner import UnityInstall
+
+    editors = find_unity_editors()
+    if getattr(args, "unity", None):
+        candidate = Path(args.unity)
+        for found in editors:
+            if found.exe == candidate:
+                return found
+        if candidate.is_file():
+            return UnityInstall(exe=candidate, version="")
+        _log.error("--unity 指向的文件不存在：%s", candidate)
+        return None
+    return editors[0] if editors else None
+
+
 def _do_unity_import(args: argparse.Namespace, export_root: Path, prior_failures: int) -> int:
     if not args.project:
         _log.error("--project 是必须的：请指定 Unity/团结引擎 项目目录。")
         return EXIT_USAGE
 
-    editors = find_unity_editors()
-    editor = None
-    if getattr(args, "unity", None):
-        candidate = Path(args.unity)
-        for found in editors:
-            if found.exe == candidate:
-                editor = found
-                break
-        if editor is None and candidate.is_file():
-            from .unity.runner import UnityInstall
-
-            editor = UnityInstall(exe=candidate, version="")
-    elif editors:
-        editor = editors[0]
-
+    editor = _resolve_unity_editor(args)
     if editor is None:
         _log.error("未找到 Unity/团结引擎 编辑器，请使用 --unity 指定。")
         return EXIT_ERROR
@@ -437,6 +449,76 @@ def _do_unity_import(args: argparse.Namespace, export_root: Path, prior_failures
             print(f"校验报告 : {report}")
 
     if not result.ok or prior_failures:
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def _do_unity_package(
+    args: argparse.Namespace, export_root: Path, prior_failures: int
+) -> int:
+    """Import (unless told not to) and write a ``.unitypackage``.
+
+    Packaging is only possible inside the editor -- ``AssetDatabase.ExportPackage``
+    is what stamps our configured importer settings into the package -- so this
+    needs a Unity project and will stage the export under its ``Assets/`` if it
+    is not there yet.
+    """
+    if not args.project:
+        _log.error("--project 是必须的：打包需要在 Unity 项目内进行。")
+        return EXIT_USAGE
+    if not Path(export_root).is_dir():
+        _log.error("导出目录不存在：%s", export_root)
+        return EXIT_ERROR
+
+    editor = _resolve_unity_editor(args)
+    if editor is None:
+        _log.error("未找到 Unity/团结引擎 编辑器，请使用 --unity 指定。")
+        return EXIT_ERROR
+
+    package = Path(args.unity_package).resolve()
+    include_editor = not getattr(args, "no_editor_scripts", False)
+
+    result = run_batch_package(
+        editor,
+        args.project,
+        export_root,
+        package,
+        include_editor_scripts=include_editor,
+        import_first=not getattr(args, "no_import", False),
+        on_output=None if args.json else (lambda line: _log.debug("%s", line)),
+    )
+
+    produced = package if package.is_file() else None
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "editor": editor.to_payload(),
+                    "project": str(args.project),
+                    "export_root": str(export_root),
+                    "package": str(package),
+                    "package_bytes": produced.stat().st_size if produced else 0,
+                    "include_editor_scripts": include_editor,
+                    "imported_first": not getattr(args, "no_import", False),
+                    "returncode": result.returncode,
+                    "log_path": str(result.log_path),
+                    "duration_seconds": round(result.duration_s, 2),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print(f"编辑器   : {editor.label}")
+        print(f"项目     : {args.project}")
+        print(f"退出码   : {result.returncode}")
+        if produced is not None:
+            print(f"Unity 包 : {produced}（{produced.stat().st_size / 1048576:.1f} MB）")
+        else:
+            print(f"Unity 包 : 未生成（期望路径 {package}）")
+        print(f"日志     : {result.log_path}")
+
+    if not result.ok or produced is None or prior_failures:
         return EXIT_ERROR
     return EXIT_OK
 
@@ -481,6 +563,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unity-project", metavar="DIR", help="同时把 Editor 脚本安装到该项目")
     p.add_argument("--unity-import", action="store_true", help="导出后立即执行 Unity 批处理导入")
     p.add_argument("--project", metavar="DIR", help="配合 --unity-import 的 Unity 项目目录")
+    p.add_argument(
+        "--unity-package",
+        metavar="FILE",
+        help="导出后打包成 .unitypackage（隐含导入步骤，需要 --project）",
+    )
+    p.add_argument(
+        "--no-editor-scripts",
+        action="store_true",
+        help="配合 --unity-package：包内不包含 Editor 导入脚本",
+    )
     p.add_argument("--unity", metavar="PATH", help="Unity.exe / Tuanjie.exe 路径")
     p.set_defaults(func=cmd_convert)
 
@@ -490,6 +582,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unity", metavar="PATH", help="Unity.exe / Tuanjie.exe 路径")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_unity_import)
+
+    p = sub.add_parser(
+        "unity-package",
+        help="把 UnityExport 打包成一个 .unitypackage（含导入设置）",
+        description=(
+            "在 Unity 项目内导入 UnityExport，然后用 AssetDatabase.ExportPackage "
+            "写出一个 .unitypackage。这样包内会带上本工具配置好的导入设置"
+            "（Avatar、动画循环、贴图 sRGB、材质绑定），换到别的工程导入后无需重配。"
+        ),
+    )
+    p.add_argument("export_root", metavar="EXPORT_ROOT", help="UnityExport 目录")
+    p.add_argument("--project", required=True, metavar="DIR", help="Unity/团结引擎 项目目录")
+    p.add_argument(
+        "--unity-package",
+        required=True,
+        metavar="FILE",
+        help="输出的 .unitypackage 路径（必须写在目标工程的 Assets 之外）",
+    )
+    p.add_argument(
+        "--no-import",
+        action="store_true",
+        help="跳过导入步骤，直接把项目里已导入的内容打包",
+    )
+    p.add_argument(
+        "--no-editor-scripts",
+        action="store_true",
+        help="包内不包含 Editor 导入脚本（目标工程已装过时用，避免 asmdef 冲突）",
+    )
+    p.add_argument("--unity", metavar="PATH", help="Unity.exe / Tuanjie.exe 路径")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_unity_package)
 
     return parser
 

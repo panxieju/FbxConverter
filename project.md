@@ -391,9 +391,49 @@ JSON 会膨胀一个数量级，而 `JsonUtility` 要整体解析它。
 | `FBXCONV_UNREAL_EDITOR` | `unreal/locator` | 直接指定 `UnrealEditor-Cmd.exe` 或引擎根目录 |
 | `FBXCONV_UNITY_EDITOR` | `unity/runner` | 直接指定 `Unity.exe` / `Tuanjie.exe` |
 | `FBXCONV_UNITY_EXPORT` | C# 导入器 | 指定 `UnityExport` 目录 |
+| `FBXCONV_UNITY_PACKAGE` | C# 打包 | 指定输出的 `.unitypackage` 路径 |
+| `FBXCONV_UNITY_PACKAGE_INCLUDE_EDITOR` | C# 打包 | `0`/`false` 时包内不含 `Editor/` 脚本 |
 | `FBXCONV_FORCE_CLI` | `packaging/entry.py` | 让窗口版 exe 走 CLI（调试用） |
 | `FBXCONV_BUILD_MODE` | `FbxConverter.spec` | `onedir`（默认）/ `onefile` |
 | `FBXCONV_JOB` / `FBXCONV_RESULT` / `FBXCONV_RUN_DIR` | `ue_scripts` | 见 §5.1 |
+
+### 5.6 打包 `.unitypackage`
+
+多了一条 Unity 侧命令：
+
+```
+fbxconv unity-package <UnityExport> --project <Unity工程> --unity-package <文件> [--no-import] [--no-editor-scripts]
+```
+
+C# 侧两个批处理入口：
+
+| `-executeMethod` 后缀 | 行为 |
+|---|---|
+| `ImportAndPackFromCommandLine` | 先导入，再打包（默认） |
+| `ExportPackageFromCommandLine` | 只打包工程里已导入的内容（`--no-import`） |
+
+**为什么必须在编辑器里做**：`.unitypackage` 是 gzip tar，条目为
+`<guid>/asset` + `<guid>/asset.meta` + `<guid>/pathname`。`asset.meta` 就是
+Unity 的导入设置 YAML，而 `AssetDatabase.ExportPackage` 只接受编辑器**已经导入**
+且位于 `Assets/` 下的资源。走这条路，包里带的正是本工具配置好的设置
+（Avatar、每个剪辑的 `loopTime`、贴图 `textureType`/`sRGBTexture`、材质与贴图的
+GUID 绑定）；手写 tar 就只能自己编 YAML，一旦 meta 不完整，接收方工程会按默认值
+重新导入——Avatar 丢失、循环标记归零、法线贴图当基色用。
+
+两条硬约束：
+
+- 包必须写在**目标工程的 `Assets/` 之外**（否则 Unity 会把它当资源导入），
+  C# 侧 `IsInsideAssets()` 会直接拒绝。
+- 打包前必须先导入：`ExportUnityPackage` 会用 `AssetDatabase.IsValidFolder`
+  与 `LoadAssetAtPath` 逐个过滤，跳过尚未导入的路径，避免 Unity 为未知路径
+  报错并吐出一个**残缺**的包。
+
+实测（Rapier_AnimSet，117 FBX + 4 贴图 + Editor 脚本，团结引擎 2022.3.62t11）：
+73.7 MB 导出目录 → **11.0 MB** `.unitypackage`，45 秒。
+随后用一个**全新工程** `-importPackage` 导入并独立核对：
+117 模型 / 113 剪辑 / 4 贴图 / 3 静态网格，Avatar `SK_MannequinAvatar` 有效，
+角色包围盒 1.4075×1.8329×0.4352 m，68 骨骼，循环标记 **18 循环 / 95 非循环**
+全部保留，贴图类型与 sRGB 全部正确。
 
 ---
 
@@ -790,7 +830,7 @@ FbxConverter/
     ue_scripts/                → 在 Unreal 内执行
       fbxconv_common.py  fbxconv_scan.py  fbxconv_export.py  fbxconv_textures.py
     ui/{app,main_window,pages,widgets,worker,__init__}.py
-  tests/                       192 个单元测试
+  tests/                       217 个单元测试
     test_discover.py           目录解析、.uproject 查找、伴随文件
     test_paths.py              包路径换算、文件名净化与去重
     test_models.py             资源分类、骨架分组、同名消歧、空组过滤

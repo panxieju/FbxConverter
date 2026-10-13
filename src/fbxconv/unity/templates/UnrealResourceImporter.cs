@@ -253,6 +253,16 @@ namespace FbxConverter.Editor
         public const string DefaultExportFolderName = "UnityExport";
         public const string ExportRootEnvVar = "FBXCONV_UNITY_EXPORT";
         public const string ExportRootArg = "-fbxconvExport";
+        public const string PackageEnvVar = "FBXCONV_UNITY_PACKAGE";
+        public const string PackageArg = "-fbxconvPackage";
+        public const string PackageEditorEnvVar = "FBXCONV_UNITY_PACKAGE_INCLUDE_EDITOR";
+
+        /// <summary>
+        /// Set by <see cref="Fail"/>. A single batch invocation may run several
+        /// steps (import, then package), and <c>EditorApplication.Exit</c> only
+        /// *requests* an exit, so later steps have to check this themselves.
+        /// </summary>
+        private static bool stepFailed;
 
         //: A humanoid should measure roughly this tall, in metres.
         private const float MinHumanoidHeight = 0.3f;
@@ -316,6 +326,7 @@ namespace FbxConverter.Editor
 
         private static void Fail(string message)
         {
+            stepFailed = true;
             Debug.LogError("[FbxConverter] " + message);
             if (Application.isBatchMode)
             {
@@ -346,17 +357,276 @@ namespace FbxConverter.Editor
         }
 
         // -------------------------------------------------------------------
+        // .unitypackage
+        // -------------------------------------------------------------------
+
+        [MenuItem("Tools/FbxConverter/Export Unity Package...")]
+        public static void ExportPackageFromDialog()
+        {
+            string root = ResolveExportRoot();
+            if (string.IsNullOrEmpty(root))
+            {
+                EditorUtility.DisplayDialog(
+                    "FbxConverter",
+                    "找不到 UnityExport 目录。请先执行一次“Import Unreal Export...”。",
+                    "OK");
+                return;
+            }
+
+            // Default next to the project, never inside Assets -- Unity would
+            // treat a .unitypackage under Assets as an asset to import.
+            string project = Directory.GetParent(Application.dataPath).FullName;
+            string name = Path.GetFileName(root.TrimEnd(Path.DirectorySeparatorChar));
+            string chosen = EditorUtility.SaveFilePanel(
+                "保存 Unity package", project, name + ".unitypackage", "unitypackage");
+            if (string.IsNullOrEmpty(chosen))
+            {
+                return;
+            }
+            stepFailed = false;
+            ExportUnityPackage(root, chosen, IncludeEditorScripts());
+        }
+
+        /// <summary>
+        /// Batch entry point: import the export, then write a .unitypackage.
+        /// </summary>
+        public static void ImportAndPackFromCommandLine()
+        {
+            string root = ResolveExportRoot();
+            string package = ResolvePackagePath();
+            if (!ValidatePackInputs(root, package))
+            {
+                return;
+            }
+            stepFailed = false;
+            try
+            {
+                Import(root);
+                if (stepFailed)
+                {
+                    Debug.LogError("[FbxConverter] 导入未通过校验，不生成 package。");
+                    EditorApplication.Exit(1);
+                    return;
+                }
+                if (!ExportUnityPackage(root, package, IncludeEditorScripts()))
+                {
+                    EditorApplication.Exit(1);
+                }
+            }
+            catch (Exception exception)
+            {
+                Debug.LogError("[FbxConverter] 生成 package 失败: " + exception);
+                EditorApplication.Exit(1);
+            }
+        }
+
+        /// <summary>
+        /// Batch entry point: package what is already imported, without
+        /// re-running the importer.
+        /// </summary>
+        public static void ExportPackageFromCommandLine()
+        {
+            string root = ResolveExportRoot();
+            string package = ResolvePackagePath();
+            if (!ValidatePackInputs(root, package))
+            {
+                return;
+            }
+            stepFailed = false;
+            try
+            {
+                if (!ExportUnityPackage(root, package, IncludeEditorScripts()))
+                {
+                    EditorApplication.Exit(1);
+                }
+            }
+            catch (Exception exception)
+            {
+                Debug.LogError("[FbxConverter] 生成 package 失败: " + exception);
+                EditorApplication.Exit(1);
+            }
+        }
+
+        private static bool ValidatePackInputs(string root, string package)
+        {
+            if (string.IsNullOrEmpty(root))
+            {
+                Fail("未提供导出目录。请设置环境变量 " + ExportRootEnvVar +
+                     " 或传入 " + ExportRootArg + " <path>。");
+                return false;
+            }
+            if (string.IsNullOrEmpty(package))
+            {
+                Fail("未提供 package 输出路径。请设置环境变量 " + PackageEnvVar +
+                     " 或传入 " + PackageArg + " <path>。");
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Write every asset under <paramref name="exportRoot"/> into a
+        /// .unitypackage.
+        ///
+        /// Unity can only export assets it has itself imported and that live
+        /// under <c>Assets/</c>. That constraint is also the point: the package
+        /// then carries the importer settings this tool configured -- the
+        /// avatar, per-clip loop flags, texture sRGB and type, and the material
+        /// assignment -- instead of leaving the importing project to guess from
+        /// defaults.
+        /// </summary>
+        public static bool ExportUnityPackage(string exportRoot, string packagePath, bool includeEditor)
+        {
+            exportRoot = EnsureInsideAssets(exportRoot);
+            string rootAsset = ToAssetPath(exportRoot);
+            if (rootAsset == null)
+            {
+                Fail("导出目录不在 Assets 下，无法打包: " + exportRoot);
+                return false;
+            }
+
+            string destination = Path.GetFullPath(packagePath);
+            if (!destination.EndsWith(".unitypackage", StringComparison.OrdinalIgnoreCase))
+            {
+                destination += ".unitypackage";
+            }
+            if (IsInsideAssets(destination))
+            {
+                Fail("package 必须写在 Assets 之外，否则 Unity 会把它当作资源导入: " + destination);
+                return false;
+            }
+
+            AssetDatabase.Refresh();
+
+            List<string> candidates = new List<string>();
+            foreach (string directory in Directory.GetDirectories(exportRoot))
+            {
+                string name = Path.GetFileName(directory);
+                if (!includeEditor && name.Equals("Editor", StringComparison.OrdinalIgnoreCase))
+                {
+                    Debug.Log("[FbxConverter] 按要求排除 Editor 脚本目录。");
+                    continue;
+                }
+                candidates.Add(rootAsset + "/" + name);
+            }
+            foreach (string file in Directory.GetFiles(exportRoot))
+            {
+                string name = Path.GetFileName(file);
+                if (name.EndsWith(".meta", StringComparison.OrdinalIgnoreCase) ||
+                    name.EndsWith(".unitypackage", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                candidates.Add(rootAsset + "/" + name);
+            }
+
+            // Unity logs an error per unknown path and would happily emit a
+            // partial package, so filter to what it actually knows about.
+            List<string> paths = new List<string>();
+            foreach (string path in candidates)
+            {
+                if (AssetDatabase.IsValidFolder(path) ||
+                    AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path) != null)
+                {
+                    paths.Add(path);
+                    continue;
+                }
+                Debug.LogWarning("[FbxConverter] 跳过尚未导入的路径: " + path);
+            }
+            if (paths.Count == 0)
+            {
+                Fail("没有可打包的资源，导出目录里没有 Unity 已导入的内容。");
+                return false;
+            }
+
+            string parent = Path.GetDirectoryName(destination);
+            if (!string.IsNullOrEmpty(parent))
+            {
+                Directory.CreateDirectory(parent);
+            }
+            if (File.Exists(destination))
+            {
+                File.Delete(destination);
+            }
+
+            AssetDatabase.ExportPackage(paths.ToArray(), destination, ExportPackageOptions.Recurse);
+            AssetDatabase.Refresh();
+
+            if (!File.Exists(destination) || new FileInfo(destination).Length == 0)
+            {
+                Fail("Unity 没有写出 package: " + destination);
+                return false;
+            }
+
+            long bytes = new FileInfo(destination).Length;
+            Debug.Log(string.Format(
+                CultureInfo.InvariantCulture,
+                "[FbxConverter] 已生成 Unity package：{0}（{1:0.0} MB，{2} 个顶层条目，Editor 脚本{3}）",
+                destination,
+                bytes / 1048576.0,
+                paths.Count,
+                includeEditor ? "已包含" : "未包含"));
+            return true;
+        }
+
+        /// <summary>Absolute path under Assets/ to its "Assets/..." form.</summary>
+        private static string ToAssetPath(string absolute)
+        {
+            string data = Path.GetFullPath(Application.dataPath).Replace('\\', '/').TrimEnd('/');
+            string full = Path.GetFullPath(absolute).Replace('\\', '/').TrimEnd('/');
+            if (!full.StartsWith(data, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+            return "Assets" + full.Substring(data.Length);
+        }
+
+        private static bool IsInsideAssets(string absolute)
+        {
+            return ToAssetPath(absolute) != null;
+        }
+
+        private static bool IncludeEditorScripts()
+        {
+            string fromEnv = Environment.GetEnvironmentVariable(PackageEditorEnvVar);
+            if (!string.IsNullOrEmpty(fromEnv))
+            {
+                return !(fromEnv == "0" ||
+                         fromEnv.Equals("false", StringComparison.OrdinalIgnoreCase));
+            }
+            return true; // self-contained by default
+        }
+
+        private static string ResolvePackagePath()
+        {
+            string fromEnv = Environment.GetEnvironmentVariable(PackageEnvVar);
+            if (!string.IsNullOrEmpty(fromEnv))
+            {
+                return Path.GetFullPath(fromEnv);
+            }
+            string[] args = Environment.GetCommandLineArgs();
+            for (int i = 0; i < args.Length - 1; i++)
+            {
+                if (string.Equals(args[i], PackageArg, StringComparison.OrdinalIgnoreCase))
+                {
+                    return Path.GetFullPath(args[i + 1]);
+                }
+            }
+            return null;
+        }
+
+        // -------------------------------------------------------------------
         // Core
         // -------------------------------------------------------------------
 
-        public static void Import(string exportRoot)
+        public static bool Import(string exportRoot)
         {
             exportRoot = EnsureInsideAssets(exportRoot);
             string manifestPath = Path.Combine(exportRoot, "manifest.json");
             if (!File.Exists(manifestPath))
             {
                 Fail("找不到 manifest.json: " + manifestPath);
-                return;
+                return false;
             }
 
             Manifest manifest = JsonUtility.FromJson<Manifest>(File.ReadAllText(manifestPath, Encoding.UTF8));
@@ -369,7 +639,7 @@ namespace FbxConverter.Editor
             if (!hasCharacters && !hasStatics)
             {
                 Fail("manifest.json 中没有角色或静态网格条目。");
-                return;
+                return false;
             }
 
             Debug.Log(string.Format(
@@ -403,6 +673,7 @@ namespace FbxConverter.Editor
             string reportPath = WriteReport(
                 exportRoot, manifest, results, textureResults, staticResults);
             ReportSummary(results, textureResults, staticResults, reportPath);
+            return true;
         }
 
         private static ValidationEntry ImportCharacter(

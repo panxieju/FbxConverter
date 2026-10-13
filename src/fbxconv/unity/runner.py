@@ -22,6 +22,13 @@ EXE_NAME_SET = {name.lower() for name in EXE_NAMES}
 IMPORT_METHOD = "FbxConverter.Editor.UnrealResourceImporter.ImportFromCommandLine"
 IMPORT_ENV = "FBXCONV_UNITY_EXPORT"
 
+#: Import the export, then write a .unitypackage from it.
+PACKAGE_METHOD = "FbxConverter.Editor.UnrealResourceImporter.ImportAndPackFromCommandLine"
+#: Package an export the project has already imported.
+EXPORT_PACKAGE_METHOD = "FbxConverter.Editor.UnrealResourceImporter.ExportPackageFromCommandLine"
+PACKAGE_ENV = "FBXCONV_UNITY_PACKAGE"
+PACKAGE_EDITOR_ENV = "FBXCONV_UNITY_PACKAGE_INCLUDE_EDITOR"
+
 DEFAULT_TIMEOUT = 3600.0
 
 OutputCallback = Callable[[str], None]
@@ -178,6 +185,80 @@ def run_batch_import(
     extra_args: Sequence[str] = (),
 ) -> UnityRunResult:
     """Run the C# importer inside ``project_path`` in batch mode."""
+    return _run_batch(
+        install,
+        project_path,
+        export_root,
+        method=IMPORT_METHOD,
+        env={IMPORT_ENV: str(Path(export_root).resolve())},
+        log_name="fbxconv-import.log",
+        log_path=log_path,
+        timeout=timeout,
+        on_output=on_output,
+        extra_args=extra_args,
+        describe="批处理导入",
+    )
+
+
+def run_batch_package(
+    install: UnityInstall,
+    project_path: str | Path,
+    export_root: str | Path,
+    package_path: str | Path,
+    *,
+    include_editor_scripts: bool = True,
+    import_first: bool = True,
+    log_path: Path | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    on_output: OutputCallback | None = None,
+    extra_args: Sequence[str] = (),
+) -> UnityRunResult:
+    """Import (optional) then write a ``.unitypackage``.
+
+    Packaging has to happen inside the editor: ``AssetDatabase.ExportPackage``
+    is the only way to get the importer settings we configured (avatar, clip
+    loop flags, texture sRGB, material bindings) into the package, and it only
+    accepts assets the editor has already imported under ``Assets/``.
+    """
+    package = Path(package_path).resolve()
+    if package.suffix.lower() != ".unitypackage":
+        package = package.with_suffix(".unitypackage")
+    package.parent.mkdir(parents=True, exist_ok=True)
+
+    method = PACKAGE_METHOD if import_first else EXPORT_PACKAGE_METHOD
+    return _run_batch(
+        install,
+        project_path,
+        export_root,
+        method=method,
+        env={
+            IMPORT_ENV: str(Path(export_root).resolve()),
+            PACKAGE_ENV: str(package),
+            PACKAGE_EDITOR_ENV: "1" if include_editor_scripts else "0",
+        },
+        log_name="fbxconv-package.log",
+        log_path=log_path,
+        timeout=timeout,
+        on_output=on_output,
+        extra_args=extra_args,
+        describe="批处理打包",
+    )
+
+
+def _run_batch(
+    install: UnityInstall,
+    project_path: str | Path,
+    export_root: str | Path,
+    *,
+    method: str,
+    env: dict[str, str],
+    log_name: str,
+    log_path: Path | None,
+    timeout: float,
+    on_output: OutputCallback | None,
+    extra_args: Sequence[str],
+    describe: str,
+) -> UnityRunResult:
     project = Path(project_path)
     if not project.is_dir():
         raise FileNotFoundError(f"Unity 项目不存在：{project}")
@@ -187,7 +268,7 @@ def run_batch_import(
         raise FileNotFoundError(f"导出目录不存在：{export}")
 
     if log_path is None:
-        log_path = project / "Logs" / "fbxconv-import.log"
+        log_path = project / "Logs" / log_name
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -199,16 +280,16 @@ def run_batch_import(
         "-projectPath",
         str(project),
         "-executeMethod",
-        IMPORT_METHOD,
+        method,
         "-logFile",
         str(log_path),
         *extra_args,
     ]
 
-    env = os.environ.copy()
-    env[IMPORT_ENV] = str(export)
+    child_env = os.environ.copy()
+    child_env.update(env)
 
-    _log.info("启动 %s 批处理导入：%s", install.label, project.name)
+    _log.info("启动 %s %s：%s", install.label, describe, project.name)
     started = time.monotonic()
     tail: list[str] = []
 
@@ -224,7 +305,7 @@ def run_batch_import(
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=env,
+        env=child_env,
         creationflags=creationflags,
     )
     try:
@@ -260,10 +341,15 @@ def run_batch_import(
 
 
 __all__ = [
+    "EXPORT_PACKAGE_METHOD",
     "IMPORT_ENV",
     "IMPORT_METHOD",
+    "PACKAGE_EDITOR_ENV",
+    "PACKAGE_ENV",
+    "PACKAGE_METHOD",
     "UnityInstall",
     "UnityRunResult",
     "find_unity_editors",
     "run_batch_import",
+    "run_batch_package",
 ]

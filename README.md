@@ -84,10 +84,36 @@ python -m fbxconv convert H:\Proj\Content --out G:\Out --all `
 
 # 只跑 Unity 侧导入（对已有导出结果）
 python -m fbxconv unity-import G:\Out\UnityExport --project G:\MyUnityProject
+
+# 打成 .unitypackage（先导入再打包，含 Editor 导入脚本）
+python -m fbxconv unity-package G:\Out\UnityExport `
+  --project G:\MyUnityProject `
+  --unity-package G:\MyUnityProject\Artifacts\MyPack.unitypackage
+
+# 导出后一步到位：转换 → 导入 → 打包
+python -m fbxconv convert H:\Proj\Content --out G:\Out --all `
+  --project G:\MyUnityProject --unity-package G:\Out\MyPack.unitypackage
 ```
 
 > `--out` 请用**绝对路径**：Unreal 进程的工作目录与当前终端不同，
 > 相对路径会被解析到引擎目录下。
+
+### `.unitypackage` 说明
+
+`unity-package` 会先在目标工程里**导入**一次，再用
+`AssetDatabase.ExportPackage` 写出包。这一步必须在编辑器内做，也正是它的价值：
+
+- 包里带的是**已经配好的导入设置**——Avatar、每个动画的循环标记、贴图类型与
+  sRGB、材质与贴图的绑定关系。换到别的工程 Import Package 之后不需要重配。
+- 用 `--no-editor-scripts` 可以让包内不含 `Editor/` 脚本，避免目标工程
+  已有同名 asmdef 时报 `CS0101`。
+- 用 `--no-import` 跳过导入步骤，直接把工程里已导入的内容打包（更快，
+  但设置以工程当前状态为准）。
+- **包必须写在目标工程的 `Assets/` 之外**，否则 Unity 会把它当成一个资源导入。
+
+实测（Rapier_AnimSet，117 FBX + 4 贴图 + Editor 脚本）：73.7 MB 的导出目录
+打成 **11.0 MB** 的 `.unitypackage`，导入一个全新工程后核对：113 个剪辑、
+Avatar 有效、角色高 1.8329 m、18 个循环标记全部保留。
 
 ---
 
