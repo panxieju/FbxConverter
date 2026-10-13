@@ -621,3 +621,219 @@ class TestWizardNavigation:
         finally:
             window.close()
 
+
+# --------------------------------------------------------------------------- #
+# The blunt instrument: touch every widget
+#
+# All three crashes in this module's history were "an exception escaped a Qt
+# slot" -- which is fatal (qFatal -> 0xC0000409), not a printed traceback:
+#   * QPlainTextEdit.setTextColor          (a method that does not exist)
+#   * QListWidgetItem.setCheckState(0, ..) (the QTreeWidgetItem signature)
+#   * start_export(requests=None) receiving clicked's `checked=False`
+# None of them are visible to a linter or to a test that only reads state.
+# Clicking everything is the only cheap defence that covers all three.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def inert_workers(monkeypatch):
+    """Keep the workers from launching an engine, without hiding signature bugs.
+
+    ``run()`` is replaced (not ``__init__``), so constructing a worker -- where
+    the ``list(False)`` bug lived -- still happens for real.
+    """
+    from fbxconv.ui import worker as worker_module
+
+    monkeypatch.setattr(worker_module.ScanWorker, "run", lambda self: None)
+    monkeypatch.setattr(worker_module.ExportWorker, "run", lambda self: None)
+
+
+@pytest.fixture
+def no_dialogs(monkeypatch):
+    """Stop every modal dialog from blocking the headless run."""
+    warnings: list[str] = []
+    from PyQt5.QtWidgets import QFileDialog
+
+    from fbxconv.ui import main_window as main_window_module
+
+    monkeypatch.setattr(
+        main_window_module.MainWindow, "warn", lambda self, message: warnings.append(message)
+    )
+    # "浏览…" opens a real file dialog, which would wait for a human forever.
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: ""))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: ("", "")))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: ("", "")))
+    return warnings
+
+
+class TestEveryWidgetIsSafeToUse:
+    def test_clicking_every_button_on_every_page(
+        self, qt_app, content_dir, output_dir, inert_workers, no_dialogs, monkeypatch
+    ):
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtWidgets import QAbstractButton
+
+        from fbxconv.ui import main_window as main_window_module
+
+        monkeypatch.setattr(
+            main_window_module, "open_in_file_manager", lambda path: None
+        )
+
+        window = _make_window()
+        try:
+            _fill(window, content_dir, output_dir)
+
+            clicked: list[str] = []
+            for index, page in enumerate(window.pages):
+                if page is window.select_page:
+                    # The real scan populates this; here it is injected after the
+                    # scan page has been walked, because clicking "开始扫描"
+                    # legitimately resets scan/plan/report.
+                    window.scan = _scan_result()
+                window.go_to(index)
+                if page is window.select_page:
+                    for row in range(window.select_page.group_list.topLevelItemCount()):
+                        item = window.select_page.group_list.topLevelItem(row)
+                        if item.flags() & Qt.ItemIsUserCheckable:
+                            item.setCheckState(0, Qt.Checked)
+                    window.select_page._set_all(True)
+                    window.select_page._update_summary()
+
+                for button in page.findChildren(QAbstractButton):
+                    if not button.isEnabled():
+                        continue
+                    clicked.append(f"{type(page).__name__}.{button.text()}")
+                    button.click()
+                    qt_app.processEvents()
+
+            # The walk really did press the two buttons that mattered.
+            assert any("开始扫描" in entry for entry in clicked), clicked
+            assert any("开始转换" in entry for entry in clicked), clicked
+        finally:
+            window.close()
+
+    def test_toggling_every_checkbox(
+        self, qt_app, content_dir, output_dir, inert_workers, no_dialogs
+    ):
+        from PyQt5.QtWidgets import QCheckBox
+
+        window = _make_window()
+        try:
+            _fill(window, content_dir, output_dir)
+            window.scan = _scan_result()
+            window.select_page.on_enter()
+            for index, page in enumerate(window.pages):
+                window.go_to(index)
+                for box in page.findChildren(QCheckBox):
+                    box.setChecked(not box.isChecked())
+                    box.setChecked(not box.isChecked())
+                    qt_app.processEvents()
+        finally:
+            window.close()
+
+    def test_changing_every_combo_box(
+        self, qt_app, content_dir, output_dir, inert_workers, no_dialogs
+    ):
+        from PyQt5.QtWidgets import QComboBox
+
+        window = _make_window()
+        try:
+            _fill(window, content_dir, output_dir)
+            window.scan = _scan_result()
+            window.select_page.on_enter()
+            for index, page in enumerate(window.pages):
+                window.go_to(index)
+                for combo in page.findChildren(QComboBox):
+                    for row in range(combo.count()):
+                        combo.setCurrentIndex(row)
+                        qt_app.processEvents()
+        finally:
+            window.close()
+
+    def test_run_button_does_not_pass_a_bool_as_requests(
+        self, qt_app, content_dir, output_dir, inert_workers, no_dialogs
+    ):
+        """The exact reported crash: clicked's `checked` became ``requests``."""
+        window = _make_window()
+        try:
+            _fill(window, content_dir, output_dir)
+            window.scan = _scan_result()
+            window.select_page.on_enter()
+            window.go_to(4)
+            assert window.plan is not None
+
+            window.run_page.start_button.click()
+            qt_app.processEvents()
+
+            assert window._export_worker is not None
+            assert window._export_worker._requests is None
+            assert window._export_worker._previous is None
+        finally:
+            window.close()
+
+    def test_start_export_rejects_a_positional_argument(self, qt_app):
+        """Keyword-only keeps a stray signal argument from being interpreted."""
+        window = _make_window()
+        try:
+            with pytest.raises(TypeError):
+                window.start_export(False)  # type: ignore[misc]
+        finally:
+            window.close()
+
+
+class TestNoConnectedSlotAcceptsOptionalArguments:
+    """Static half of the same guard.
+
+    ``QPushButton.clicked`` emits ``checked``. PyQt truncates the signal's
+    arguments to the slot's arity, but a parameter with a default is still
+    filled -- measured: a slot ``def slot(self, value=None)`` receives
+    ``(False,)``. So connecting a signal directly to such a method hands it a
+    bool, which is how ``start_export(requests=None)`` ended up doing
+    ``list(False)``.
+
+    Runtime clicking (above) catches the ones that actually break; this catches
+    the shape, including in paths no test happens to press.
+    """
+
+    def test_no_connect_target_has_a_defaulted_parameter(self):
+        import ast
+        import pathlib
+        import re
+
+        ui = pathlib.Path(__file__).resolve().parents[1] / "src" / "fbxconv" / "ui"
+        defaulted: dict[str, str] = {}
+        for path in sorted(ui.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.FunctionDef):
+                    continue
+                positional = node.args.posonlyargs + node.args.args
+                if not positional or positional[0].arg != "self":
+                    continue
+                tail = positional[1:]
+                first_default = len(tail) - len(node.args.defaults)
+                has_default = any(i >= first_default for i in range(len(tail)))
+                has_default = has_default or any(
+                    d is not None for d in node.args.kw_defaults
+                )
+                if has_default:
+                    defaulted[node.name] = f"{path.name}:{node.lineno}"
+        # The methods we know about, so a rename cannot silently disable this.
+        assert "start_export" in defaulted
+
+        offenders: list[str] = []
+        for path in sorted(ui.glob("*.py")):
+            for lineno, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                if ".connect(" not in line:
+                    continue
+                for name in defaulted:
+                    if re.search(r"connect\(\s*(?:[\w.]+\.)?" + name + r"\s*\)", line):
+                        offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+
+        assert not offenders, (
+            "信号会把参数塞进带默认值的形参：改用 lambda 或把参数设为仅关键字。\n"
+            + "\n".join(offenders)
+        )
+

@@ -1004,16 +1004,21 @@ class RunPage(WizardPage):
         controls = QHBoxLayout()
         self.start_button = QPushButton("开始转换")
         self.start_button.setMinimumWidth(120)
-        self.start_button.clicked.connect(self.window.start_export)
+        # Every connection drops the signal's `checked` argument explicitly.
+        # PyQt truncates arguments to the slot's arity, but it still *fills*
+        # optional parameters -- and `start_export(requests=None)` interpreted
+        # that `False` as a request list. A lambda says "no arguments" without
+        # relying on the slot's signature staying argument-free.
+        self.start_button.clicked.connect(lambda: self.window.start_export())
         self.cancel_button = QPushButton("取消")
         self.cancel_button.setEnabled(False)
-        self.cancel_button.clicked.connect(self.window.cancel_export)
+        self.cancel_button.clicked.connect(lambda: self.window.cancel_export())
         self.retry_button = QPushButton("重试失败项")
         self.retry_button.setEnabled(False)
-        self.retry_button.clicked.connect(self.window.retry_failed)
+        self.retry_button.clicked.connect(lambda: self.window.retry_failed())
         self.open_button = QPushButton("打开输出目录")
         self.open_button.setEnabled(False)
-        self.open_button.clicked.connect(self.window.open_output)
+        self.open_button.clicked.connect(lambda: self.window.open_output())
 
         for button in (self.start_button, self.cancel_button, self.retry_button, self.open_button):
             controls.addWidget(button)

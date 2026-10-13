@@ -713,6 +713,56 @@ TypeError: setCheckState(self, state: Qt.CheckState): too many arguments
 `ensure_plan`、运行页表格与条目更新。这类“把每个控件都摸一遍”的测试是这里唯一
 有效的防线——静态检查看不出 `Qt` 重载签名，只有真的把控件建出来才会报错。
 
+### 6.21 信号会把参数塞进**带默认值**的形参
+
+第三次同族崩溃，这次在“开始转换”：
+
+```
+File ".../ui/worker.py", line 112, in __init__
+    self._requests = list(requests) if requests is not None else None
+TypeError: 'bool' object is not iterable
+```
+
+`QPushButton.clicked` 会发出 `checked`（普通按钮永远是 `False`）。
+而 `RunPage` 是直连的：
+
+```python
+self.start_button.clicked.connect(self.window.start_export)   # requests=False ！
+```
+
+PyQt 会把信号参数**按槽函数的形参个数截断**——但**带默认值的形参照样会被填**。
+实测（`QPushButton.clicked`）：
+
+| 槽函数形态 | 实际收到 |
+|---|---|
+| `def slot(self)` | `()` |
+| `def slot(self, value)` | `(False,)` |
+| `def slot(self, value=None)` | `(False,)` |
+| `def slot(self, value=None, other=None)` | `(False, None)` |
+
+所以 `start_export(self, requests=None, previous=None)` 收到的是
+`requests=False, previous=None` → `list(False)` → 槽函数抛异常 → `qFatal` → `0xC0000409`。
+**这也解释了为什么前面 10 个直连的按钮都没事**：它们的槽函数除 `self` 外没有形参，
+PyQt 一个参数都不传。
+
+修法两处，互为保险：
+
+1. `start_export` 的两个参数改为**仅关键字**（`*`）——`co_argcount` 不含仅关键字参数，
+   PyQt 便不再传参；
+2. `RunPage` 的四个按钮改为 `lambda: ...` 显式丢弃 `checked`，
+   不再依赖“槽函数签名恰好没有形参”这种脆弱前提。
+
+审计命令（`ast` 遍历 + 正则匹配 `.connect(`）已固化成
+`TestNoConnectedSlotAcceptsOptionalArguments`：它断言 UI 包里没有任何
+`connect(...)` 直连带默认值形参的方法，报错时给出文件名与行号。
+再配上“把每一页每个按钮/复选框/下拉框都动一遍”的运行时测试，这类问题
+既有静态拦截也有动态兜底。
+
+> 三次崩溃（§6.13 `setTextColor`、§6.20 `setCheckState`、§6.21 信号参数）
+> 都是同一个模式：**异常从 Qt 槽函数逃逸 = 进程死亡**。
+> 因此这里的策略不是“再写一个用例”，而是“把每个控件都动一遍 +
+> 用 `ast` 拦掉已知的接口误用形状”。
+
 ---
 
 ## 7. 目录结构
@@ -740,7 +790,7 @@ FbxConverter/
     ue_scripts/                → 在 Unreal 内执行
       fbxconv_common.py  fbxconv_scan.py  fbxconv_export.py  fbxconv_textures.py
     ui/{app,main_window,pages,widgets,worker,__init__}.py
-  tests/                       186 个单元测试
+  tests/                       192 个单元测试
     test_discover.py           目录解析、.uproject 查找、伴随文件
     test_paths.py              包路径换算、文件名净化与去重
     test_models.py             资源分类、骨架分组、同名消歧、空组过滤

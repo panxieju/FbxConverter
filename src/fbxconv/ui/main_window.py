@@ -267,9 +267,19 @@ class MainWindow(QMainWindow):
 
     def start_export(
         self,
+        *,
         requests: Sequence[ExportRequest] | None = None,
         previous: Sequence[ExportOutcome] | None = None,
     ) -> None:
+        """Export the current plan (or just ``requests`` when retrying).
+
+        The parameters are keyword-only on purpose. ``QPushButton.clicked``
+        emits ``checked``, and PyQt hands that argument to *any* parameter with a
+        default -- so a positional ``requests`` used to receive ``False`` and
+        ``list(False)`` killed the editor connection with a ``TypeError``
+        escaping the slot. Callers must also connect through a lambda; see the
+        run page.
+        """
         if self._export_worker is not None and self._export_worker.isRunning():
             return
         plan = self.plan or self.ensure_plan()
