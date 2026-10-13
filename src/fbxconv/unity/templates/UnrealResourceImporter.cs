@@ -966,18 +966,34 @@ namespace FbxConverter.Editor
                 }
             }
 
-            // Did the remap actually take? A material still named after Unity's
-            // default means the FBX carried no usable material node for that
-            // slot, which is a real (reportable) limitation, not a success.
+            // Did the remap actually take? A slot left on a default material
+            // means the FBX carried no usable material node for it -- usually
+            // because Unreal itself had none assigned (UE's own
+            // WorldGridMaterial is what gets exported then), or because the
+            // material had no texture parameters for the exporter to write.
+            // That is a real limitation, so report it rather than count it as a
+            // success.
+            List<string> defaultSlots = new List<string>();
+            List<string> defaultNames = new List<string>();
             for (int index = 0; index < entry.materialNames.Count; index++)
             {
                 string name = entry.materialNames[index];
-                if (name == "Default-Material" || name == "Default-Material (Instance)" ||
-                    name == "WorldGridMaterial" || name == "(null)")
+                if (!IsDefaultMaterialName(name))
                 {
-                    entry.problems.Add("材质槽 " + index + " 仍在使用 Unity 默认材质（" + name +
-                        "）：该网格的材质没有随 FBX 导出。");
+                    continue;
                 }
+                defaultSlots.Add(index.ToString(CultureInfo.InvariantCulture));
+                if (!defaultNames.Contains(name))
+                {
+                    defaultNames.Add(name);
+                }
+            }
+            if (defaultSlots.Count > 0)
+            {
+                entry.problems.Add(
+                    "材质槽 " + string.Join("/", defaultSlots) + " 没有得到可用材质（FBX 里是 " +
+                    string.Join("/", defaultNames) +
+                    "）：该网格在 Unreal 里很可能没有指定材质，Unity 侧无可还原。");
             }
 
             if (materials.Count > 0 && mesh.slots != null)
@@ -998,6 +1014,16 @@ namespace FbxConverter.Editor
                 entry.status = "warnings";
             }
             return entry;
+        }
+
+        private static bool IsDefaultMaterialName(string name)
+        {
+            // Unity's own placeholders, plus the default material Unreal writes
+            // into the FBX when the mesh has nothing assigned.
+            return string.IsNullOrEmpty(name)
+                   || name == "(null)"
+                   || name.StartsWith("Default-Material", StringComparison.Ordinal)
+                   || name.StartsWith("WorldGridMaterial", StringComparison.Ordinal);
         }
 
         private static void MeasureMesh(string assetPath, StaticMeshEntry entry)
