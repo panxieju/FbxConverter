@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/FbxConverter.iml" filepath="$PROJECT_DIR$/.idea/FbxConverter.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/fbxconv.iml" filepath="$PROJECT_DIR$/.idea/fbxconv.iml" />
     </modules>
   </component>
 </project>

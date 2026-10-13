@@ -645,6 +645,45 @@ Unity 版本差异已实测确认（团结引擎 2022.3.62t11）：
 实测 `1M_Cube` 导入后正好 1.000×1.000×1.000 m，说明 UE 的厘米 → Unity 的米
 换算在静态网格上同样正确。
 
+### 6.19 向导状态必须即时发布，且拒绝要给出理由
+
+用户实测反馈：“第二步点击扫描没反应”。
+
+根因是向导页之间的一条**单向状态链断了**：
+
+```python
+# 修复前
+def _start_scan(self):
+    if self.window.install is None or self.window.config.content_root is None:
+        return                      # ← 静默返回，界面上什么都不会发生
+    self.window.start_scan()        # 它内部才调用 apply_to_config()
+```
+
+`config.content_root` 只由 `DirectoryPage.apply_to_config()` 写入，而首次配置时
+该字段是 `None`，且**没有任何地方**在第 1 步 → 第 2 步的切换中把输入框内容发布出去。
+于是表单填得完全正确，按钮就是不动。
+
+两个连带问题：
+
+- 如果 `AppConfig` 里**恰好记住了**上一次的路径，界面会**静默扫描那个旧目录**，
+  比没反应更危险——用户以为扫的是新选的目录。
+- 底部状态栏读的也是 `config`，于是持续显示“请选择 Unreal 资源目录”，
+  与输入框内容自相矛盾。这是当时界面上唯一的线索。
+
+修法：
+
+1. `DirectoryPage.apply_to_config(remember=False)` 在**每次编辑**时发布，
+   `on_leave()` 再发布一次（`remember=True`）；
+2. `content_root` 只在**真正解析为已存在目录**时才写入，
+   半截路径与过期路径都进不了 config；
+3. `content_problem() -> str | None` 返回具体原因，`_start_scan()` 用它替换静默返回，
+   并由 `window.warn()` 弹给用户；
+4. 输出目录与挂载方式原来只连着 `_refresh_state`，同样没发布 config，
+   现在一起走 `_sync_and_refresh()`。
+
+教训写成规则：**任何按钮都不许“什么都不做”**。要么干活，要么说清楚为什么不能干。
+`tests/test_ui_flow.py` 现在钉住这条链路（含“过期 config 必须被界面覆盖”这一条）。
+
 ---
 
 ## 7. 目录结构
@@ -672,7 +711,7 @@ FbxConverter/
     ue_scripts/                → 在 Unreal 内执行
       fbxconv_common.py  fbxconv_scan.py  fbxconv_export.py  fbxconv_textures.py
     ui/{app,main_window,pages,widgets,worker,__init__}.py
-  tests/                       151 个单元测试
+  tests/                       164 个单元测试
     test_discover.py           目录解析、.uproject 查找、伴随文件
     test_paths.py              包路径换算、文件名净化与去重
     test_models.py             资源分类、骨架分组、同名消歧、空组过滤
@@ -683,6 +722,7 @@ FbxConverter/
     test_diagnostics.py        挂载点不匹配诊断
     test_unity_install.py      Editor 脚本投放与 Test Framework 门控
     test_ui_logging.py         GUI 日志链路（曾在真实运行时崩过）
+    test_ui_flow.py            向导状态发布与扫描按钮（曾经静默无反应）
 ```
 
 ---

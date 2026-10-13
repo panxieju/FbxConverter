@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PyQt5.QtCore import Qt
@@ -141,13 +142,13 @@ class DirectoryPage(WizardPage):
         form.addRow("Unreal 资源目录", self.content_picker)
 
         self.output_picker = PathPicker(mode="dir", placeholder="Unity 输出目录")
-        self.output_picker.changed.connect(lambda _: self._refresh_state())
+        self.output_picker.changed.connect(lambda _: self._sync_and_refresh())
         form.addRow("Unity 输出目录", self.output_picker)
 
         self.mount_combo = QComboBox()
         for mode in MountMode:
             self.mount_combo.addItem(mode.label, mode.value)
-        self.mount_combo.currentIndexChanged.connect(lambda _: self._refresh_state())
+        self.mount_combo.currentIndexChanged.connect(lambda _: self._sync_and_refresh())
         form.addRow("独立项目挂载方式", self.mount_combo)
         self.body.addWidget(dirs_box)
 
@@ -167,12 +168,53 @@ class DirectoryPage(WizardPage):
             self.output_picker.set_path(self.window.config.output_root)
         self._refresh_state()
 
+    def on_leave(self) -> bool:
+        # Page 1 owns the engine/directory choices, so leaving it is the last
+        # chance to publish them. Without this, ``config.content_root`` stayed
+        # ``None`` and the scan button on page 2 was a silent no-op.
+        self.apply_to_config()
+        return True
+
     def is_complete(self) -> bool:
-        return self.window.install is not None and self._content_ok() and bool(
-            self.output_picker.text()
-        )
+        return self.content_problem() is None
 
     # --------------------------------------------------------------- internal
+
+    def _resolved_content(self) -> Path | None:
+        """The content root the current text resolves to, or ``None``."""
+        text = self.content_picker.text()
+        if not text:
+            return None
+        try:
+            info = resolve_content_root(text)
+        except ContentRootError:
+            return None
+        return info.path if info.path.is_dir() else None
+
+    def content_problem(self) -> str | None:
+        """Why the form cannot proceed, or ``None`` when it is fine.
+
+        Returning a reason (rather than a bare ``False``) is deliberate: the
+        original bug was a button that did nothing, and "nothing" is
+        indistinguishable from a crash for the person clicking it.
+        """
+        if self.window.install is None:
+            return (
+                "没有可用的 Unreal Editor：请选择列表中的引擎，"
+                "或手动指定 UnrealEditor-Cmd.exe。"
+            )
+        text = self.content_picker.text()
+        if not text:
+            return "请选择 Unreal 资源目录（Content 文件夹或资源包目录）。"
+        try:
+            info = resolve_content_root(text)
+        except ContentRootError as exc:
+            return f"资源目录不可用：{exc}"
+        if not info.path.is_dir():
+            return f"资源目录不存在：{info.path}"
+        if not self.output_picker.text():
+            return "请选择 Unity 输出目录。"
+        return None
 
     def _populate_engines(self) -> None:
         self.engine_combo.blockSignals(True)
@@ -200,12 +242,16 @@ class DirectoryPage(WizardPage):
             self.engine_path.setEnabled(False)
         else:
             self.engine_path.setEnabled(True)
-        self._refresh_state()
+        self._sync_and_refresh()
 
     def _on_content_changed(self) -> None:
+        # Publish immediately so the status bar and the scan page always agree
+        # with what is actually in the form.
+        self.apply_to_config(remember=False)
         text = self.content_picker.text()
         if not text:
             self.project_info.setText("尚未选择资源目录。")
+            self.project_info.setStyleSheet(f"color: {COLOR_MUTED};")
             self._refresh_state()
             return
         try:
@@ -247,21 +293,36 @@ class DirectoryPage(WizardPage):
             self.project_info.setText(f"⚠ 无法识别 Unreal 路径：{editor}")
         self.window.refresh_navigation()
 
+    def _sync_and_refresh(self) -> None:
+        """Publish the form, then repaint. Every widget routes through here."""
+        self.apply_to_config(remember=False)
+        self._refresh_state()
+
     # ------------------------------------------------------------------ state
 
-    def apply_to_config(self) -> None:
+    def apply_to_config(self, *, remember: bool = True) -> None:
+        """Publish the form into :class:`AppConfig`.
+
+        ``content_root`` is only written when it actually resolves to an
+        existing directory, so a half-typed path can never be scanned and a
+        remembered path can never win over what is on screen.
+        """
         config = self.window.config
         if self.window.install is not None:
             config.unreal_editor = self.window.install.editor_cmd
-            config.remember_unreal_editor(self.window.install.editor_cmd)
-        content = self.content_picker.path()
-        if content is not None:
-            config.content_root = content
+            if remember:
+                config.remember_unreal_editor(self.window.install.editor_cmd)
+
+        content = self._resolved_content()
+        config.content_root = content
+        if content is not None and remember:
             config.remember_content_root(content)
+
         output = self.output_picker.path()
-        if output is not None:
-            config.output_root = output
-            config.remember_output_root(output)
+        config.output_root = output if output is not None else None
+        if config.output_root is not None and remember:
+            config.remember_output_root(config.output_root)
+
         config.link_mode = self.mount_combo.currentData() or MountMode.JUNCTION.value
 
 
@@ -338,9 +399,16 @@ class ScanPage(WizardPage):
     # ----------------------------------------------------------------- actions
 
     def _start_scan(self) -> None:
-        if self.window.install is None or self.window.config.content_root is None:
+        window = self.window
+        # Page 1 may have been edited and left behind; pull its state first so
+        # the scan always runs on what the user actually chose.
+        window.directory_page.apply_to_config()
+        problem = window.directory_page.content_problem()
+        if problem is not None:
+            window.warn(problem)
             return
-        self.window.start_scan()
+
+        window.start_scan()
         self.scan_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress.reset()

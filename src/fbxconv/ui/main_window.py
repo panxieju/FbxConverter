@@ -192,12 +192,12 @@ class MainWindow(QMainWindow):
     def start_scan(self) -> None:
         self.directory_page.apply_to_config()
         if self.install is None:
-            self._warn("没有可用的 Unreal Editor。")
+            self.warn("没有可用的 Unreal Editor。")
             return
         content = self.config.content_root
         work = self.work_root
         if content is None or work is None:
-            self._warn("请先设置资源目录和输出目录。")
+            self.warn("请先设置资源目录和输出目录。")
             return
 
         self.scan = None
@@ -274,11 +274,11 @@ class MainWindow(QMainWindow):
             return
         plan = self.plan or self.ensure_plan()
         if plan is None:
-            self._warn("无法建立转换计划：请确认已扫描并选择了骨架组。")
+            self.warn("无法建立转换计划：请确认已扫描并选择了骨架组。")
             return
         self.plan = plan
         if self.install is None:
-            self._warn("没有可用的 Unreal Editor。")
+            self.warn("没有可用的 Unreal Editor。")
             return
 
         if requests is None and previous is None:
@@ -320,7 +320,7 @@ class MainWindow(QMainWindow):
     def open_output(self) -> None:
         root = self.export_root
         if root is None or not root.exists():
-            self._warn("输出目录尚未生成。")
+            self.warn("输出目录尚未生成。")
             return
         open_in_file_manager(root)
 
@@ -360,7 +360,7 @@ class MainWindow(QMainWindow):
         if detail:
             _log.debug("%s", detail)
 
-    def _warn(self, message: str) -> None:
+    def warn(self, message: str) -> None:
         _log.warning("%s", message)
         QMessageBox.warning(self, APP_DISPLAY_NAME, message)
 
